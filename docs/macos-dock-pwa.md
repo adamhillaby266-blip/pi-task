@@ -23,6 +23,16 @@
 
 预期页面状态为 `HTTP 200`。
 
+## 升级已安装的后台服务
+
+需要升级源码时，双击 Finder 中的 `bin/upgrade-pi-task-macos.command`，确认当前没有活动 Run 后输入 `UPGRADE`。它会：先进行隔离构建和页面冒烟，再短暂停止后台服务、提升已验证构建、恢复原有 LaunchAgent；若新构建无法启动，会尝试恢复上一份 `.next`。全过程不复制、删除或迁移 Pi 对话、认证或 Task 数据，也不会发送模型提示词。
+
+也可在终端运行：
+
+```bash
+./scripts/upgrade-macos-background-service.sh --confirm-idle
+```
+
 ## 加入 Dock
 
 后台服务已正常运行后，任选一个浏览器完成一次：
@@ -60,7 +70,9 @@ Pi Task 不识别 Clash、Shadowrocket、Surge 等具体软件；它使用通用
 3. macOS 当前启用的系统 HTTP/HTTPS 代理；
 4. 直连。
 
-后台服务启动时读取该配置，不会把代理地址、端口或凭据写入 LaunchAgent、日志、浏览器接口或仓库。同一时间只应让一个代理工具接管系统代理；切换 Clash、Shadowrocket 或系统代理后，确认没有活动 Run，再刷新后台服务：
+后台服务启动时、以及每条新的顶层模型消息发送前都会读取当前配置，不会把代理地址、端口或凭据写入 LaunchAgent、日志、浏览器接口或仓库。同一时间只应让一个代理工具接管系统代理。
+
+切换 Clash、Shadowrocket、VPN 或系统代理时，正在流式输出的 Run 不会被强行中断；等它结束后，下一条新消息会自动建立新连接并使用当前网络路径，通常不再需要手动重启服务。若旧版本仍在运行、或某条请求已卡住，可在确认没有活动 Run 后使用：
 
 ```bash
 ./scripts/restart-macos-background-service.sh --confirm-idle

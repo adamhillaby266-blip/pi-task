@@ -60,7 +60,7 @@ E4 的目标是让用户从 Dock 打开 Pi Task，而无需每次保留启动终
 
 - `scripts/install-macos-background-service.sh --confirm-install` 会写入 `~/Library/LaunchAgents/com.pi-task.local.plist`，创建 `~/Library/Logs/Pi Task/`，并以当前 Node 绝对路径、`127.0.0.1:30142`、`RunAtLoad/KeepAlive` 启动 Pi Task；不需要 `sudo`，也不设置 Pi 数据目录变量。
 - `scripts/status-macos-background-service.sh` 检查 LaunchAgent、本机页面和不含代理地址的网络来源；`scripts/restart-macos-background-service.sh --confirm-idle` 可在切换代理后重启空闲服务；`scripts/uninstall-macos-background-service.sh --confirm-remove` 只移除该服务配置，保留 Pi 数据、Task 数据、构建和日志。
-- 服务进程优先使用标准 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，其次是权限受限的 `~/.pi-task/network.env`，再读取 macOS 当前 HTTP/HTTPS 系统代理；不会把代理值写入 plist、日志或浏览器 API。SOCKS/PAC-only 配置需要用户在代理工具中启用 HTTP/Mixed 或系统 HTTP/HTTPS 代理。
+- 服务进程优先使用标准 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，其次是权限受限的 `~/.pi-task/network.env`，再读取 macOS 当前 HTTP/HTTPS 系统代理；不会把代理值写入 plist、日志或浏览器 API。服务启动时和每条新的顶层模型消息发送前都会重新解析当前配置；仅在没有活动 Run 时替换连接池，因此切换 VPN/代理后下一条新消息可自动采用新路径，而流式输出不会被强行中断。SOCKS/PAC-only 配置需要用户在代理工具中启用 HTTP/Mixed 或系统 HTTP/HTTPS 代理。
 - Safari/Chrome 的“添加到 Dock / 安装 Pi Task”仍需用户手势完成；PWA 只作为界面，后台服务负责本机页面可用性。
 
 2026-08-06，目标 Mac 用户按安装、状态检查和 Dock 打开清单完成操作后确认“可以了，没问题”。这确认了日常入口：用户级服务可用，关闭原启动终端后可从 Dock 打开 Pi Task，既有对话/Task 保持可见；验收未报告模型提示词。
