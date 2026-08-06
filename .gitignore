@@ -1,0 +1,61 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.npm-cache
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# local validation/runtime and build data
+/.runtime
+/.turbo
+/.cache
+
+# local Pi / Pi Task state accidentally placed in a checkout
+/.pi/
+/.pi-task/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.jsonl
+
+# misc and private key material
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+
+# debug and logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+.factory

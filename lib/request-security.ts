@@ -1,0 +1,93 @@
+import { isIP } from "node:net";
+
+function normalizeHostname(value: string): string {
+  const unbracketed = value.startsWith("[") && value.endsWith("]")
+    ? value.slice(1, -1)
+    : value;
+  return unbracketed.toLowerCase().replace(/\.$/, "");
+}
+
+function hostnameFromAuthority(value: string): string | null {
+  if (!value || /[\s/@\\]/.test(value)) return null;
+  try {
+    const parsed = new URL(`http://${value}`);
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      return null;
+    }
+    return normalizeHostname(parsed.hostname);
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "::1") {
+    return true;
+  }
+  return isIP(hostname) === 4 && hostname.startsWith("127.");
+}
+
+function canonicalOrigin(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function getRequestOrigin(request: Request): string | null {
+  const requestUrl = new URL(request.url);
+  const host = request.headers.get("host");
+  return host ? canonicalOrigin(`${requestUrl.protocol}//${host}`) : null;
+}
+
+function isUserInitiatedSessionExportNavigation(request: Request): boolean {
+  if (
+    request.method !== "GET"
+    || request.headers.get("sec-fetch-mode") !== "navigate"
+    || request.headers.get("sec-fetch-dest") !== "document"
+    || request.headers.get("sec-fetch-user") !== "?1"
+  ) {
+    return false;
+  }
+
+  try {
+    return /^\/api\/sessions\/[^/]+\/export$/.test(new URL(request.url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Only trust loopback names and addresses; Pi Task does not support LAN hosts. */
+export function isApiRequestHostAllowed(request: Request): boolean {
+  const host = request.headers.get("host");
+  const hostname = host ? hostnameFromAuthority(host) : null;
+  return hostname !== null && isLoopbackHostname(hostname);
+}
+
+/** Reject browser cross-site API requests while preserving non-browser clients. */
+export function isApiRequestOriginAllowed(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite === "cross-site") return false;
+  if (!origin) return true;
+
+  const requestOrigin = getRequestOrigin(request);
+  return requestOrigin !== null && canonicalOrigin(origin) === requestOrigin;
+}
+
+export function shouldCheckApiRequestOrigin(request: Request): boolean {
+  return request.headers.has("origin") || request.headers.has("sec-fetch-site");
+}
+
+export function isApiRequestAllowed(request: Request): boolean {
+  if (!isApiRequestHostAllowed(request)) return false;
+  if (isUserInitiatedSessionExportNavigation(request)) return true;
+  return !shouldCheckApiRequestOrigin(request) || isApiRequestOriginAllowed(request);
+}
+
+export function hasJsonContentType(request: Request): boolean {
+  const mediaType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/json"
+    || Boolean(mediaType?.startsWith("application/") && mediaType.endsWith("+json"));
+}
