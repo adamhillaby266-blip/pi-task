@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +44,20 @@ export interface NetworkProxyStatus {
   warnings: NetworkProxyWarning[];
 }
 
+/** Values are consumed only by Undici. They are never returned by the browser API. */
+export interface NetworkProxyAgentOptions {
+  httpProxy: string;
+  httpsProxy: string;
+  noProxy: string;
+}
+
+export interface NetworkProxyResolution {
+  agentOptions: NetworkProxyAgentOptions;
+  /** Hash only; raw proxy values are never persisted in process-wide diagnostics. */
+  fingerprint: string;
+  status: NetworkProxyStatus;
+}
+
 interface MacosSystemProxy {
   httpProxy?: string;
   httpsProxy?: string;
@@ -58,11 +73,6 @@ interface LocalConfigLoadResult {
   warnings: NetworkProxyWarning[];
 }
 
-interface ResolvedNetworkProxy {
-  assignments: ProxyConfigValues;
-  status: NetworkProxyStatus;
-}
-
 interface ConfigureNetworkProxyOptions {
   environment?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
@@ -70,6 +80,9 @@ interface ConfigureNetworkProxyOptions {
   readConfig?: (path: string) => LocalConfigLoadResult;
   readMacosProxy?: () => { proxy: MacosSystemProxy; state: MacosSystemState; warnings: NetworkProxyWarning[] };
 }
+
+type ResolvedProxy = { source: ProxySource; value: string };
+type ResolvedNoProxy = { source: NoProxySource; value: string };
 
 const directMacosProxy: MacosSystemProxy = {
   httpInvalid: false,
@@ -242,14 +255,18 @@ function readMacosSystemProxy(): { proxy: MacosSystemProxy; state: MacosSystemSt
   }
 }
 
-function readEnvironmentValue(environment: NodeJS.ProcessEnv, upper: "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY", lower: "http_proxy" | "https_proxy" | "no_proxy") {
+function readEnvironmentValue(
+  environment: NodeJS.ProcessEnv,
+  upper: "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY",
+  lower: "http_proxy" | "https_proxy" | "no_proxy",
+): { found: boolean; value: string } {
   if (hasOwn(environment, lower) && environment[lower] !== undefined) {
     return { found: true, value: environment[lower] ?? "" };
   }
   if (hasOwn(environment, upper) && environment[upper] !== undefined) {
     return { found: true, value: environment[upper] ?? "" };
   }
-  return { found: false, value: undefined };
+  return { found: false, value: "" };
 }
 
 function resolveNetworkProxy({
@@ -266,74 +283,87 @@ function resolveNetworkProxy({
   localConfigState: LocalConfigState;
   macosSystemState: MacosSystemState;
   warnings: NetworkProxyWarning[];
-}): ResolvedNetworkProxy {
-  const assignments: ProxyConfigValues = {};
+}): NetworkProxyResolution {
   const httpEnvironment = readEnvironmentValue(environment, "HTTP_PROXY", "http_proxy");
   const httpsEnvironment = readEnvironmentValue(environment, "HTTPS_PROXY", "https_proxy");
   const noProxyEnvironment = readEnvironmentValue(environment, "NO_PROXY", "no_proxy");
 
   const resolveProxy = (
-    environmentValue: { found: boolean; value: string | undefined },
+    environmentValue: { found: boolean; value: string },
     configKey: "HTTP_PROXY" | "HTTPS_PROXY",
     systemValue: string | undefined,
-  ): { source: ProxySource; value: string | undefined } => {
-    if (environmentValue.found) return { source: environmentValue.value ? "environment" : "direct", value: environmentValue.value };
-    if (hasOwn(localConfig, configKey)) return { source: localConfig[configKey] ? "local-config" : "direct", value: localConfig[configKey] };
+  ): ResolvedProxy => {
+    if (environmentValue.found) {
+      return { source: environmentValue.value ? "environment" : "direct", value: environmentValue.value };
+    }
+    if (hasOwn(localConfig, configKey)) {
+      const value = localConfig[configKey] ?? "";
+      return { source: value ? "local-config" : "direct", value };
+    }
     if (systemValue) return { source: "macos-system", value: systemValue };
-    return { source: "direct", value: undefined };
+    return { source: "direct", value: "" };
   };
 
   const http = resolveProxy(httpEnvironment, "HTTP_PROXY", macosProxy.httpProxy);
   const https = resolveProxy(httpsEnvironment, "HTTPS_PROXY", macosProxy.httpsProxy);
 
-  if (!httpEnvironment.found && hasOwn(localConfig, "HTTP_PROXY")) assignments.HTTP_PROXY = http.value ?? "";
-  else if (!httpEnvironment.found && http.source === "macos-system" && http.value) assignments.HTTP_PROXY = http.value;
-
-  if (!httpsEnvironment.found && hasOwn(localConfig, "HTTPS_PROXY")) assignments.HTTPS_PROXY = https.value ?? "";
-  else if (!httpsEnvironment.found && https.source === "macos-system" && https.value) assignments.HTTPS_PROXY = https.value;
+  let noProxy: ResolvedNoProxy;
+  if (noProxyEnvironment.found) {
+    noProxy = { source: "environment", value: noProxyEnvironment.value };
+  } else if (hasOwn(localConfig, "NO_PROXY")) {
+    noProxy = { source: "local-config", value: localConfig.NO_PROXY ?? "" };
+  } else if (http.value || https.value) {
+    noProxy = { source: "default", value: DEFAULT_NO_PROXY };
+  } else {
+    noProxy = { source: "unset", value: "" };
+  }
 
   const effectiveHttps = https.value
     ? { source: https.source, enabled: true, fallsBackToHttp: false }
     : http.value
       ? { source: http.source, enabled: true, fallsBackToHttp: true }
       : { source: "direct" as const, enabled: false, fallsBackToHttp: false };
-
-  let noProxySource: NoProxySource = "unset";
-  let noProxyEnabled = false;
-  if (noProxyEnvironment.found) {
-    noProxySource = "environment";
-    noProxyEnabled = Boolean(noProxyEnvironment.value);
-  } else if (hasOwn(localConfig, "NO_PROXY")) {
-    assignments.NO_PROXY = localConfig.NO_PROXY ?? "";
-    noProxySource = localConfig.NO_PROXY ? "local-config" : "unset";
-    noProxyEnabled = Boolean(localConfig.NO_PROXY);
-  } else if (http.value || https.value) {
-    assignments.NO_PROXY = DEFAULT_NO_PROXY;
-    noProxySource = "default";
-    noProxyEnabled = true;
-  }
-
-  return {
-    assignments,
-    status: {
-      initialized: true,
-      http: { source: http.source, enabled: Boolean(http.value) },
-      https: effectiveHttps,
-      noProxy: { source: noProxySource, enabled: noProxyEnabled },
-      localConfig: localConfigState,
-      macosSystem: macosSystemState,
-      warnings: [...new Set(warnings)],
-    },
+  const status: NetworkProxyStatus = {
+    initialized: true,
+    http: { source: http.source, enabled: Boolean(http.value) },
+    https: effectiveHttps,
+    noProxy: { source: noProxy.source, enabled: Boolean(noProxy.value) },
+    localConfig: localConfigState,
+    macosSystem: macosSystemState,
+    warnings: [...new Set(warnings)],
   };
+  const agentOptions: NetworkProxyAgentOptions = {
+    // Passing empty strings intentionally prevents EnvHttpProxyAgent from
+    // silently re-reading a stale value that a previous refresh injected.
+    httpProxy: http.value,
+    httpsProxy: https.value,
+    noProxy: noProxy.value,
+  };
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({
+      httpProxy: agentOptions.httpProxy,
+      httpsProxy: agentOptions.httpsProxy,
+      noProxy: agentOptions.noProxy,
+      httpSource: status.http.source,
+      httpsSource: status.https.source,
+      noProxySource: status.noProxy.source,
+    }))
+    .digest("base64url");
+
+  return { agentOptions, fingerprint, status };
 }
 
-export function configureNetworkProxyEnvironment(options: ConfigureNetworkProxyOptions = {}): NetworkProxyStatus {
+/**
+ * Resolve the current outbound network route without mutating process.env.
+ * macOS system proxy values are intentionally re-read on every call so a new
+ * top-level model prompt can use the currently active VPN/proxy route.
+ */
+export function resolveNetworkProxyConfiguration(options: ConfigureNetworkProxyOptions = {}): NetworkProxyResolution {
   const environment = options.environment ?? process.env;
   const targetPlatform = options.platform ?? process.platform;
   const configPath = targetPlatform === "darwin"
     ? defaultMacosNetworkProxyConfigPath(options.homeDirectory ?? homedir())
     : undefined;
-
   const localResult = configPath
     ? (options.readConfig ?? readPrivateNetworkProxyConfig)(configPath)
     : { values: {}, state: "not-used" as const, warnings: [] as NetworkProxyWarning[] };
@@ -347,9 +377,13 @@ export function configureNetworkProxyEnvironment(options: ConfigureNetworkProxyO
   const shouldReadMacosProxy = targetPlatform === "darwin" && (!hasHttpOverride || !hasHttpsOverride);
   const macosResult = shouldReadMacosProxy
     ? (options.readMacosProxy ?? readMacosSystemProxy)()
-    : { proxy: directMacosProxy, state: targetPlatform === "darwin" ? "unchecked" as const : "not-applicable" as const, warnings: [] as NetworkProxyWarning[] };
+    : {
+      proxy: directMacosProxy,
+      state: targetPlatform === "darwin" ? "unchecked" as const : "not-applicable" as const,
+      warnings: [] as NetworkProxyWarning[],
+    };
 
-  const resolved = resolveNetworkProxy({
+  const resolution = resolveNetworkProxy({
     environment,
     localConfig: localResult.values,
     macosProxy: macosResult.proxy,
@@ -357,12 +391,12 @@ export function configureNetworkProxyEnvironment(options: ConfigureNetworkProxyO
     macosSystemState: macosResult.state,
     warnings: [...localResult.warnings, ...macosResult.warnings],
   });
-
-  for (const [key, value] of Object.entries(resolved.assignments)) {
-    environment[key as ProxyConfigKey] = value;
-  }
-  networkProxyGlobal.__piTaskNetworkProxyStatus = resolved.status;
-  return getNetworkProxyStatus();
+  networkProxyGlobal.__piTaskNetworkProxyStatus = resolution.status;
+  return {
+    ...resolution,
+    agentOptions: { ...resolution.agentOptions },
+    status: getNetworkProxyStatus(),
+  };
 }
 
 export function getNetworkProxyStatus(): NetworkProxyStatus {

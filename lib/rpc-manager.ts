@@ -14,6 +14,7 @@ import type { InlineExtension, SlashCommandInfo } from "@earendil-works/pi-codin
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
+import { refreshHttpDispatcherForNewPrompt } from "./http-dispatcher";
 
 // ============================================================================
 // Types
@@ -351,6 +352,11 @@ export class AgentSessionWrapper {
       case "prompt": {
         if (this.inner.isBashRunning) {
           throw new Error("Cannot send a prompt while a shell command is running");
+        }
+        // A new top-level prompt is the only safe moment to replace stale VPN
+        // sockets. Never refresh while another Rpc session is actively running.
+        if (getRunningRpcSessionIds().length === 0) {
+          refreshHttpDispatcherForNewPrompt();
         }
         // Fire and forget — events come via subscribe
         const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
