@@ -6,7 +6,11 @@
 
 Pi Task is a local, conversation-first task workspace built on [Pi](https://github.com/badlogic/pi-mono). Choose one working directory, talk naturally, and formalize only the work that needs a durable plan, execution history, evidence, and human acceptance.
 
-**Conversation first · One working directory · Human controlled · Local source deployment**
+**Conversation first · One working directory · Human-controlled · Runs locally from source**
+
+![Pi Task turns a conversation into a reviewable task agreement](./docs/assets/pi-task-task-framing.png)
+
+*An isolated fictional workspace in the Chinese UI locale. It contains no real session, task, credential, or local path.*
 
 ## Why Pi Task
 

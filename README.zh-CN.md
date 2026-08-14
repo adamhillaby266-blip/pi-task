@@ -8,6 +8,10 @@ Pi Task 是一个基于 [Pi](https://github.com/badlogic/pi-mono) 的本地对�
 
 **对话优先 · 单一工作目录 · 人工掌握关键决定 · 本地源码运行**
 
+![Pi Task 将对话整理为可以审查的任务约定](./docs/assets/pi-task-task-framing.png)
+
+*画面来自完全隔离的虚构工作区，不包含真实 Session、Task、凭据或本机路径。*
+
 ## 为什么需要 Pi Task
 
 聊天记录可以解释“说过什么”，但有交付要求的工作还需要回答：
