@@ -1,13 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { EventRecord, ProjectRecord, ReviewStatus, RunStatus, TaskDetail, TaskRecord, TaskStatus } from "@/lib/task/types";
+import { checkTaskContractReadiness, type TaskContractV1 } from "@/lib/task/contract";
+import type { DelegationProfile, DelegationStatus, EventRecord, ProjectRecord, ReviewStatus, RunStatus, TaskDetail, TaskRecord, TaskStatus } from "@/lib/task/types";
+import { findMostSpecificWorkspace, workspaceDisplayName } from "@/lib/workspace-path";
 import styles from "./TaskBoard.module.css";
 
 const COLUMNS: Array<{ status: TaskStatus; label: string; hint: string }> = [
   { status: "backlog", label: "积压事项", hint: "尚未准备执行" },
   { status: "ready", label: "待办事项", hint: "可以交给 Pi" },
-  { status: "in_progress", label: "进行中", hint: "存在活动 Run" },
+  { status: "in_progress", label: "进行中", hint: "Pi 正在处理" },
   { status: "in_review", label: "待验收", hint: "等待你的判断" },
   { status: "blocked", label: "已阻塞", hint: "缺少条件" },
   { status: "done", label: "完成", hint: "已由用户验收" },
@@ -21,6 +23,18 @@ const RUN_STATUS_LABELS: Record<RunStatus, string> = {
   waiting_user: "等待用户",
   succeeded: "执行成功",
   failed: "执行失败",
+  interrupted: "已中断",
+  canceled: "已取消",
+};
+const DELEGATION_PROFILE_LABELS: Record<DelegationProfile, string> = {
+  scout: "资料侦察",
+  analyst: "独立分析",
+  critic: "反向审查",
+};
+const DELEGATION_STATUS_LABELS: Record<DelegationStatus, string> = {
+  running: "分析中",
+  succeeded: "已完成",
+  failed: "失败",
   interrupted: "已中断",
   canceled: "已取消",
 };
@@ -51,7 +65,6 @@ type ContractFields = {
   acceptanceCriteria: string;
   expectedOutput: string;
 };
-type TaskDraft = ContractFields & { status: QueueStatus };
 type ContractEditor = ContractFields & { taskId: string; version: number; status: QueueStatus };
 
 const CONTRACT_FIELD_LABELS: Record<keyof ContractFields, string> = {
@@ -61,13 +74,20 @@ const CONTRACT_FIELD_LABELS: Record<keyof ContractFields, string> = {
   expectedOutput: "预期产物",
 };
 
-function missingContractFields(contract: ContractFields): string[] {
+function missingContractFields(contract: ContractFields & { contract?: TaskContractV1 | null }): string[] {
+  if (contract.contract) {
+    return checkTaskContractReadiness(contract.contract).checks
+      .filter((check) => !check.ready)
+      .map((check) => check.label);
+  }
   return (Object.keys(CONTRACT_FIELD_LABELS) as Array<keyof ContractFields>)
     .filter((field) => !contract[field].trim())
     .map((field) => CONTRACT_FIELD_LABELS[field]);
 }
 
 function contractEventSummary(event: EventRecord): string {
+  if (event.type === "task.contract_saved") return `任务约定草稿已保存 · revision ${String(event.payload.contractRevision ?? "-")}`;
+  if (event.type === "task.contract_confirmed") return `任务约定已由用户确认 · revision ${String(event.payload.contractRevision ?? "-")}`;
   const fields = Array.isArray(event.payload.fields) ? event.payload.fields : [];
   const labels = fields
     .filter((field): field is keyof ContractFields => typeof field === "string" && field in CONTRACT_FIELD_LABELS)
@@ -77,7 +97,10 @@ function contractEventSummary(event: EventRecord): string {
 
 type Props = {
   activeCwd: string | null;
+  workspaceRoot: string | null;
+  onStartTaskConversation: () => void;
   onProcessTask: (task: TaskDetail, session: PreparedSession) => void;
+  onFrameTask: (task: TaskDetail, session: PreparedSession) => void;
   onOpenFile: (filePath: string) => void;
   onTaskChanged?: (task: TaskDetail) => void;
 };
@@ -112,21 +135,51 @@ function taskPrompt(task: TaskDetail): string {
   ].filter(Boolean).join("\n");
 }
 
-export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged }: Props) {
+function contractItems(items: ReadonlyArray<{ text: string }>, fallback = "尚未记录"): string {
+  const values = items.map((item) => item.text.trim()).filter(Boolean);
+  return values.length > 0 ? values.join("；") : fallback;
+}
+
+function RichTaskContractSummary({ task }: { task: TaskDetail }) {
+  const contract = task.contract;
+  if (!contract) return null;
+  const readiness = checkTaskContractReadiness(contract);
+  const missingChecks = readiness.checks.filter((check) => !check.ready);
+  const blocking = contract.openDecisions.filter((decision) => decision.blocking && decision.status === "open");
+  const boundary = [
+    ...contract.scope.excluded.map((item) => `不包含：${item.text}`),
+    ...contract.constraints.map((item) => `约束：${item.text}`),
+    ...contract.gates.map((gate) => `确认门：${gate.trigger} → ${gate.requiredAction}`),
+  ];
+  return (
+    <section className={styles.richContractSummary}>
+      <header className={styles.richContractHeader}>
+        <div><span>TASK AGREEMENT</span><strong>任务约定 · R{task.contractRevision}</strong></div>
+        <span data-ready={readiness.ready}>{readiness.ready ? "足够开始" : `还需补全 ${missingChecks.length} 项`}</span>
+      </header>
+      <p className={styles.richContractOutcome}>{contract.outcome.text}</p>
+      <dl className={styles.richContractGrid}>
+        <div><dt>受众与用途</dt><dd>{contractItems(contract.audience)}</dd></div>
+        <div><dt>权威来源</dt><dd>{contractItems(contract.authoritativeSources)}</dd></div>
+        <div><dt>预期交付</dt><dd>{contractItems(contract.deliverables)}</dd></div>
+        <div><dt>验收方法</dt><dd>{contractItems(contract.acceptanceCriteria)}</dd></div>
+      </dl>
+      {blocking.length > 0 && <div className={styles.richContractDecision}><strong>待决定</strong><span>{blocking.map((decision) => decision.question).join("；")}</span></div>}
+      {boundary.length > 0 && <details className={styles.richContractBoundary}><summary>查看范围、约束与确认门</summary><ul>{boundary.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></details>}
+    </section>
+  );
+}
+
+export function TaskBoard({ activeCwd, workspaceRoot, onStartTaskConversation, onProcessTask, onFrameTask, onOpenFile, onTaskChanged }: Props) {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
-  const [projectId, setProjectId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [selectedTask, setSelectedTask] = useState<TaskDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [projectFormOpen, setProjectFormOpen] = useState(false);
-  const [taskFormOpen, setTaskFormOpen] = useState(false);
-  const [projectName, setProjectName] = useState("");
-  const [projectRoot, setProjectRoot] = useState(activeCwd ?? "");
-  const [taskDraft, setTaskDraft] = useState<TaskDraft>({ title: "", goal: "", acceptanceCriteria: "", expectedOutput: "", status: "backlog" });
   const [contractEditor, setContractEditor] = useState<ContractEditor | null>(null);
   const [saving, setSaving] = useState(false);
   const [processingTaskId, setProcessingTaskId] = useState<string | null>(null);
+  const [framingTaskId, setFramingTaskId] = useState<string | null>(null);
   const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
   const [returnReason, setReturnReason] = useState("");
   const [returnOpen, setReturnOpen] = useState(false);
@@ -137,20 +190,10 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
   const autoFocusedProjectRef = useRef<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ status: TaskStatus; beforeTaskId: string | null } | null>(null);
 
-  useEffect(() => {
-    if (activeCwd && !projectRoot) setProjectRoot(activeCwd);
-  }, [activeCwd, projectRoot]);
-
   const loadProjects = useCallback(async () => {
     const { projects: loaded } = await readApi<{ projects: ProjectRecord[] }>(await fetch("/api/projects", { cache: "no-store" }));
     setProjects(loaded);
-    setProjectId((current) => {
-      if (current && loaded.some((project) => project.id === current)) return current;
-      const cwdMatch = activeCwd ? loaded.find((project) => activeCwd === project.rootPath || activeCwd.startsWith(`${project.rootPath}/`)) : undefined;
-      return cwdMatch?.id ?? loaded[0]?.id ?? null;
-    });
-    if (loaded.length === 0) setProjectFormOpen(true);
-  }, [activeCwd]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -161,6 +204,13 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
     return () => { cancelled = true; };
   }, [loadProjects]);
 
+  const activeProject = useMemo(
+    () => findMostSpecificWorkspace(projects, activeCwd)
+      ?? findMostSpecificWorkspace(projects, workspaceRoot),
+    [activeCwd, projects, workspaceRoot],
+  );
+  const projectId = activeProject?.id ?? null;
+
   const loadTasks = useCallback(async (selectedProjectId: string) => {
     const { tasks: loaded } = await readApi<{ tasks: TaskRecord[] }>(
       await fetch(`/api/tasks?projectId=${encodeURIComponent(selectedProjectId)}`, { cache: "no-store" }),
@@ -170,6 +220,7 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
   }, []);
 
   useEffect(() => {
+    setSelectedTask(null);
     if (!projectId) {
       setTasks([]);
       return;
@@ -245,54 +296,6 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
     return () => window.clearInterval(interval);
   }, [refreshSelectedTask, selectedTask?.activeRunId, selectedTask?.id]);
 
-  async function createProject(event: React.FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    setError(null);
-    try {
-      const { project } = await readApi<{ project: ProjectRecord }>(await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: projectName, rootPath: projectRoot }),
-      }));
-      await loadProjects();
-      setProjectId(project.id);
-      setProjectFormOpen(false);
-      setProjectName("");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function createTask(event: React.FormEvent) {
-    event.preventDefault();
-    if (!projectId) return;
-    const missing = missingContractFields(taskDraft);
-    if (taskDraft.status === "ready" && missing.length > 0) {
-      setError(`还缺${missing.join("、")}；未完整的合同只能先存入积压事项`);
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      const { task } = await readApi<{ task: TaskRecord }>(await fetch("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId, ...taskDraft }),
-      }));
-      setTaskFormOpen(false);
-      setTaskDraft({ title: "", goal: "", acceptanceCriteria: "", expectedOutput: "", status: "backlog" });
-      await loadTasks(projectId);
-      await openTask(task.id);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   function openContractEditor(task: TaskDetail) {
     if (task.status !== "backlog" && task.status !== "ready") return;
     setError(null);
@@ -331,6 +334,26 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function frameTask(task: TaskRecord | TaskDetail) {
+    if ((task.status !== "backlog" && task.status !== "ready") || task.activeRunId || framingTaskId) return;
+    setFramingTaskId(task.id);
+    setError(null);
+    try {
+      const result = await readApi<{ task: TaskDetail; session: PreparedSession }>(await fetch(`/api/tasks/${encodeURIComponent(task.id)}/framing-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: task.version }),
+      }));
+      onTaskChanged?.(result.task);
+      onFrameTask(result.task, result.session);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      if (projectId) void loadTasks(projectId);
+    } finally {
+      setFramingTaskId(null);
     }
   }
 
@@ -468,7 +491,7 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
     await moveQueuedTask(source, status, beforeTaskId);
   }
 
-  const activeProject = projects.find((project) => project.id === projectId) ?? null;
+  const activeWorkspaceName = activeCwd ? workspaceDisplayName(activeCwd) : null;
   const selectedActiveRun = selectedTask?.activeRunId
     ? selectedTask.runs.find((run) => run.id === selectedTask.activeRunId) ?? null
     : null;
@@ -483,11 +506,14 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
   const lifecycleEvents = selectedTask?.events.filter((event) => (
     event.type === "task.blocked" || event.type === "task.unblocked" || event.type === "task.canceled"
   )) ?? [];
-  const contractEvents = selectedTask?.events.filter((event) => event.type === "task.contract_updated") ?? [];
+  const contractEvents = selectedTask?.events.filter((event) => (
+    event.type === "task.contract_updated"
+    || event.type === "task.contract_saved"
+    || event.type === "task.contract_confirmed"
+  )) ?? [];
   const waitingQuestion = selectedActiveRun?.status === "waiting_user"
     ? [...decisionEvents].reverse().find((event) => event.type === "run.waiting_user" && event.runId === selectedActiveRun.id)
     : null;
-  const taskDraftMissing = missingContractFields(taskDraft);
   const contractEditorMissing = contractEditor ? missingContractFields(contractEditor) : [];
   const selectedContractMissing = selectedTask ? missingContractFields(selectedTask) : [];
   const selectedQueueStatus: QueueStatus | null = selectedTask?.status === "backlog" || selectedTask?.status === "ready"
@@ -501,22 +527,32 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
       <header className={styles.toolbar}>
         <div className={styles.productTitle}>
           <span className={styles.piMark}>π</span>
-          <div><strong>Pi Task</strong><span>{activeProject?.name ?? "任务与 Agent 共用同一条工作线"}</span></div>
+          <div>
+            <strong>Pi Task</strong>
+            <span title={activeCwd ?? undefined}>{activeWorkspaceName ? `当前工作目录 · ${activeWorkspaceName}` : "先从左侧选择工作目录"}</span>
+          </div>
         </div>
         <div className={styles.toolbarActions}>
-          {projects.length > 0 && (
-            <select value={projectId ?? ""} onChange={(event) => setProjectId(event.target.value)} aria-label="选择项目">
-              {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-            </select>
-          )}
-          <button className={styles.secondaryButton} onClick={() => { setProjectRoot(activeCwd ?? ""); setProjectFormOpen(true); }}>新建项目</button>
-          <button className={styles.primaryButton} disabled={!projectId} onClick={() => setTaskFormOpen(true)}>新建任务</button>
+          <button className={styles.primaryButton} disabled={!activeCwd} onClick={onStartTaskConversation}>开始聊一个任务</button>
         </div>
       </header>
 
       {error && <div className={styles.errorBanner} role="alert"><span>{error}</span><button onClick={() => setError(null)}>关闭</button></div>}
 
       <div className={styles.content}>
+        {!loading && activeCwd && !activeProject ? (
+          <div className={styles.workspaceEmpty}>
+            <span>当前工作目录</span>
+            <strong>{activeWorkspaceName}</strong>
+            <p>这里还没有正式任务。先在对话里把事情聊清楚；只有你保存或确认任务约定后，任务才会出现在看板中。</p>
+            <button className={styles.primaryButton} onClick={onStartTaskConversation}>开始聊一个任务</button>
+          </div>
+        ) : !activeCwd ? (
+          <div className={styles.workspaceEmpty}>
+            <strong>先选择工作目录</strong>
+            <p>对话、文件和任务看板会共同使用这一处工作范围。</p>
+          </div>
+        ) : (
         <div ref={boardRef} className={styles.board} aria-label="任务状态栏，可横向滚动">
           {COLUMNS.map((column) => {
             const canReceiveQueue = column.status === "backlog" || column.status === "ready";
@@ -594,10 +630,17 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
                       >
                         <div className={styles.cardTop}><span>{task.id.slice(0, 12)}</span>{task.primarySessionId && <span title="已绑定 Pi 对话">对话 ↗</span>}</div>
                         <h3>{task.title}</h3>
-                        <p>{task.goal || "尚未补充目标"}</p>
+                        <p>{task.contract?.outcome.text || task.goal || "尚未补充目标"}</p>
+                        {task.contract && <div className={styles.richContractBadge}>任务约定 R{task.contractRevision} · {contractComplete ? "足够开始" : "仍有阻塞项"}</div>}
                         {contractMissing.length > 0 && <div className={styles.contractGap}>还缺：{contractMissing.join("、")}</div>}
                         {task.recoveryNote && <div className={styles.recovery}>需继续：{task.recoveryNote}</div>}
-                        <footer><span>{STATUS_LABEL[task.status]}</span>{task.status === "ready" && <button disabled={!contractComplete || processingTaskId === task.id} title={contractComplete ? "在对话中处理" : `还缺${contractMissing.join("、")}`} onClick={(event) => { event.stopPropagation(); void processTask(task); }}>{processingTaskId === task.id ? "准备中…" : contractComplete ? "在对话中处理" : "合同待补全"}</button>}</footer>
+                        <footer>
+                          <span>{STATUS_LABEL[task.status]}</span>
+                          {task.status === "backlog" && <button disabled={framingTaskId === task.id} onClick={(event) => { event.stopPropagation(); void frameTask(task); }}>{framingTaskId === task.id ? "准备中…" : "和 Pi 一起补全"}</button>}
+                          {task.status === "ready" && (contractComplete
+                            ? <button disabled={processingTaskId === task.id} title="在对话中处理" onClick={(event) => { event.stopPropagation(); void processTask(task); }}>{processingTaskId === task.id ? "准备中…" : "在对话中处理"}</button>
+                            : <button disabled={framingTaskId === task.id} title={`还缺${contractMissing.join("、")}`} onClick={(event) => { event.stopPropagation(); void frameTask(task); }}>{framingTaskId === task.id ? "准备中…" : "和 Pi 一起补全"}</button>)}
+                        </footer>
                       </article>
                     );
                   })}
@@ -607,6 +650,7 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
             );
           })}
         </div>
+        )}
 
         {selectedTask && (
           <aside className={styles.detail} aria-label="任务详情">
@@ -615,13 +659,16 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
               <div className={styles.detailStatus}><span className={`${styles.statusDot} ${styles[selectedTask.status]}`} /><span className={selectedActiveRun?.status === "waiting_user" ? styles.waitingStatus : undefined}>{selectedStatusLabel}</span><small>v{selectedTask.version}</small></div>
               {selectedTask.recoveryNote && <section className={`${styles.callout} ${selectedTask.status === "blocked" ? styles.blockedCallout : ""}`}><strong>{selectedTask.status === "blocked" ? "阻塞原因" : "最新补充/恢复要求"}</strong><p>{selectedTask.recoveryNote}</p></section>}
               {selectedActiveRun?.status === "waiting_user" && <section className={`${styles.callout} ${styles.waitingCallout}`}><strong>Pi 正在等待你的决定</strong><p>{waitingQuestion ? eventText(waitingQuestion, "question") : "请回到当前对话补充必要信息；收到后 Pi 会继续本轮工作。"}</p></section>}
-              {selectedQueueStatus && selectedContractMissing.length > 0 && <section className={`${styles.callout} ${styles.contractCallout}`}><strong>合同待补全</strong><p>还缺：{selectedContractMissing.join("、")}。补全前不能移入待办事项或交给 Pi。</p></section>}
-              <section><h3>目标</h3><p>{selectedTask.goal || "尚未填写"}</p></section>
-              <section><h3>验收条件</h3><p>{selectedTask.acceptanceCriteria || "尚未填写"}</p></section>
-              <section><h3>预期产物</h3><p>{selectedTask.expectedOutput || "尚未填写"}</p></section>
-              {selectedQueueStatus && <section className={styles.queueControls}><h3>合同与队列</h3><div className={styles.queueControlRow}><button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id} onClick={() => openContractEditor(selectedTask)}>编辑合同</button>{selectedQueueStatus === "backlog" ? <button className={styles.primaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedContractMissing.length > 0} title={selectedContractMissing.length > 0 ? `还缺${selectedContractMissing.join("、")}` : "移到待办事项"} onClick={() => void moveQueuedTask(selectedTask, "ready")}>移到待办</button> : <button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id} onClick={() => void moveQueuedTask(selectedTask, "backlog")}>移回积压</button>}</div><div className={styles.queueControlRow}><button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedQueueIndex <= 0} onClick={() => void moveQueuedTask(selectedTask, selectedQueueStatus, selectedQueueTasks[selectedQueueIndex - 1]?.id ?? null)}>上移</button><button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedQueueIndex < 0 || selectedQueueIndex >= selectedQueueTasks.length - 1} onClick={() => void moveQueuedTask(selectedTask, selectedQueueStatus, selectedQueueTasks[selectedQueueIndex + 2]?.id ?? null)}>下移</button></div><p className={styles.queueControlNote}>触屏或无法拖拽时，可用这些按钮调整状态和同列顺序。</p></section>}
+              {selectedQueueStatus && selectedContractMissing.length > 0 && <section className={`${styles.callout} ${styles.contractCallout}`}><strong>合同待补全</strong><p>还缺：{selectedContractMissing.join("、")}。回到主对话补全并重新确认前，不能移入待办事项或交给 Pi。</p></section>}
+              {selectedTask.contract ? <RichTaskContractSummary task={selectedTask} /> : <>
+                <section><h3>目标</h3><p>{selectedTask.goal || "尚未填写"}</p></section>
+                <section><h3>验收条件</h3><p>{selectedTask.acceptanceCriteria || "尚未填写"}</p></section>
+                <section><h3>预期产物</h3><p>{selectedTask.expectedOutput || "尚未填写"}</p></section>
+              </>}
+              {selectedQueueStatus && <section className={styles.queueControls}><h3>合同与队列</h3><div className={styles.queueControlRow}><button className={styles.primaryButton} disabled={saving || movingTaskId === selectedTask.id || framingTaskId === selectedTask.id} onClick={() => void frameTask(selectedTask)}>{framingTaskId === selectedTask.id ? "准备对话中…" : selectedTask.contract ? "回到对话修改" : "和 Pi 一起补全"}</button>{!selectedTask.contract && <button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id} title="临时保留的旧字段回退入口" onClick={() => openContractEditor(selectedTask)}>直接编辑旧字段</button>}{selectedQueueStatus === "backlog" ? <button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedContractMissing.length > 0} title={selectedContractMissing.length > 0 ? `还缺${selectedContractMissing.join("、")}` : "移到待办事项"} onClick={() => void moveQueuedTask(selectedTask, "ready")}>移到待办</button> : <button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id} onClick={() => void moveQueuedTask(selectedTask, "backlog")}>移回积压</button>}</div><div className={styles.queueControlRow}><button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedQueueIndex <= 0} onClick={() => void moveQueuedTask(selectedTask, selectedQueueStatus, selectedQueueTasks[selectedQueueIndex - 1]?.id ?? null)}>上移</button><button className={styles.secondaryButton} disabled={saving || movingTaskId === selectedTask.id || selectedQueueIndex < 0 || selectedQueueIndex >= selectedQueueTasks.length - 1} onClick={() => void moveQueuedTask(selectedTask, selectedQueueStatus, selectedQueueTasks[selectedQueueIndex + 2]?.id ?? null)}>下移</button></div><p className={styles.queueControlNote}>触屏或无法拖拽时，可用这些按钮调整状态和同列顺序。旧字段编辑暂作回退，不会替代任务约定。</p></section>}
               {contractEvents.length > 0 && <section><h3>合同记录</h3><div className={styles.decisionList}>{contractEvents.map((event) => <div key={event.id}><strong>已更新合同</strong><p>{contractEventSummary(event)}</p><small>v{event.taskVersion}</small></div>)}</div></section>}
-              {selectedTask.runs.length > 0 && <section><h3>执行记录</h3><div className={styles.recordList}>{selectedTask.runs.map((run, index) => <div key={run.id}><strong>Run {index + 1}</strong><span className={styles.recordStatus} data-status={run.status}>{RUN_STATUS_LABELS[run.status]}</span><small>{run.sessionId ? `对话 ${run.sessionId.slice(0, 8)}` : "尚未绑定对话"}</small></div>)}</div></section>}
+              {selectedTask.runs.length > 0 && <section><h3>执行记录</h3><div className={styles.recordList}>{selectedTask.runs.map((run, index) => <div key={run.id}><strong>第 {index + 1} 次执行</strong><span className={styles.recordStatus} data-status={run.status}>{RUN_STATUS_LABELS[run.status]}</span><small>{run.sessionId ? `对话 ${run.sessionId.slice(0, 8)}` : "尚未绑定对话"}</small></div>)}</div></section>}
+              {selectedTask.delegations.length > 0 && <section><h3>多 Agent 协作记录</h3><div className={styles.delegationList}>{selectedTask.delegations.map((delegation) => <details key={delegation.id}><summary><span><strong>{DELEGATION_PROFILE_LABELS[delegation.profile]}</strong><small>{delegation.model}</small></span><span className={styles.recordStatus} data-status={delegation.status}>{DELEGATION_STATUS_LABELS[delegation.status]}</span></summary><p>{delegation.prompt.split("Delegated focus:\n").at(-1)}</p>{delegation.output && <pre>{delegation.output}</pre>}{delegation.error && <small className={styles.delegationError}>{delegation.error}</small>}<footer><span>{delegation.usage.totalTokens.toLocaleString()} tokens</span>{delegation.usage.cost > 0 && <span>${delegation.usage.cost.toFixed(4)}</span>}</footer></details>)}</div></section>}
               {decisionEvents.length > 0 && <section><h3>人工决定记录</h3><div className={styles.decisionList}>{decisionEvents.map((event) => <div key={event.id}><strong>{event.type === "run.waiting_user" ? "Pi 请求补充" : "已提供决定"}</strong><p>{event.type === "run.waiting_user" ? eventText(event, "question") : eventText(event, "answer") || "用户确认继续，但未填写额外说明"}</p><small>{event.runId ? `Run ${event.runId.slice(4, 12)}` : ""}</small></div>)}</div></section>}
               {lifecycleEvents.length > 0 && <section><h3>状态记录</h3><div className={styles.decisionList}>{lifecycleEvents.map((event) => <div key={event.id}><strong>{event.type === "task.blocked" ? "已标记阻塞" : event.type === "task.unblocked" ? "已解除阻塞" : "已取消任务"}</strong><p>{eventText(event, event.type === "task.unblocked" ? "resolution" : "reason")}</p></div>)}</div></section>}
               {selectedTask.artifacts.length > 0 && <section><h3>交付物</h3><div className={styles.artifactList}>{selectedTask.artifacts.map((artifact) => <button key={artifact.id} onClick={() => onOpenFile(artifact.path)}><span>{artifact.path.split(/[\\/]/).pop()}</span><small>{artifact.verification}</small></button>)}</div></section>}
@@ -629,7 +676,8 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
             </div>
             <footer className={styles.detailActions}>
               {!returnOpen && !lifecycleAction && <>
-                {selectedTask.status === "ready" && <button className={styles.primaryButton} disabled={processingTaskId === selectedTask.id || selectedContractMissing.length > 0} title={selectedContractMissing.length > 0 ? `还缺${selectedContractMissing.join("、")}` : "在对话中处理"} onClick={() => void processTask(selectedTask)}>{processingTaskId === selectedTask.id ? "准备对话中…" : selectedContractMissing.length > 0 ? "合同待补全" : "在对话中处理"}</button>}
+                {selectedQueueStatus && <button className={styles.secondaryButton} disabled={framingTaskId === selectedTask.id} onClick={() => void frameTask(selectedTask)}>{framingTaskId === selectedTask.id ? "准备对话中…" : selectedTask.contract ? "回到对话修改" : "和 Pi 一起补全"}</button>}
+                {selectedTask.status === "ready" && selectedContractMissing.length === 0 && <button className={styles.primaryButton} disabled={processingTaskId === selectedTask.id} title="在对话中处理" onClick={() => void processTask(selectedTask)}>{processingTaskId === selectedTask.id ? "准备对话中…" : "在对话中处理"}</button>}
                 {selectedTask.status === "in_review" && <><button className={styles.secondaryButton} onClick={() => { setLifecycleAction(null); setReturnOpen(true); }}>退回修改</button><button className={styles.primaryButton} disabled={saving} onClick={() => void reviewAction("accept")}>验收通过</button></>}
                 {(selectedTask.status === "ready" || selectedTask.status === "in_progress") && <button className={styles.secondaryButton} disabled={saving} onClick={() => { setReturnOpen(false); setLifecycleReason(""); setLifecycleAction("block"); }}>{selectedTask.status === "in_progress" ? "停止并阻塞" : "标记阻塞"}</button>}
                 {selectedTask.status === "blocked" && <button className={styles.primaryButton} disabled={saving} onClick={() => { setReturnOpen(false); setLifecycleReason(""); setLifecycleAction("unblock"); }}>解除阻塞</button>}
@@ -644,13 +692,11 @@ export function TaskBoard({ activeCwd, onProcessTask, onOpenFile, onTaskChanged 
 
       {loading && <div className={styles.loading}>正在读取任务…</div>}
 
-      {(projectFormOpen || taskFormOpen || contractEditor) && <div className={styles.modalBackdrop} onMouseDown={(event) => { if (event.target === event.currentTarget && projects.length > 0) { setProjectFormOpen(false); setTaskFormOpen(false); setContractEditor(null); } }}>
-        {projectFormOpen && <form className={styles.modal} onSubmit={createProject}><header><div><span>PROJECT</span><h2>登记工作项目</h2></div>{projects.length > 0 && <button type="button" onClick={() => setProjectFormOpen(false)}>×</button>}</header><label>项目名称<input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="例如：出版成本分析" required /></label><label>允许工作目录<input value={projectRoot} onChange={(event) => setProjectRoot(event.target.value)} placeholder="工作区内的绝对路径" required /></label><p>Pi Task 只允许 Agent 在这个项目根目录内登记交付物。</p><footer><button className={styles.primaryButton} disabled={saving}>保存项目</button></footer></form>}
-        {taskFormOpen && <form className={`${styles.modal} ${styles.taskModal}`} onSubmit={createTask}><header><div><span>NEW TASK</span><h2>交代一件事</h2></div><button type="button" onClick={() => setTaskFormOpen(false)}>×</button></header><label>任务标题<input value={taskDraft.title} onChange={(event) => setTaskDraft((draft) => ({ ...draft, title: event.target.value }))} placeholder="一句话说明要完成什么" required /></label><label>目标<textarea value={taskDraft.goal} onChange={(event) => setTaskDraft((draft) => ({ ...draft, goal: event.target.value }))} placeholder="为什么做，最终要解决什么" required={taskDraft.status === "ready"} /></label><label>验收条件<textarea value={taskDraft.acceptanceCriteria} onChange={(event) => setTaskDraft((draft) => ({ ...draft, acceptanceCriteria: event.target.value }))} placeholder="怎样算合格" required={taskDraft.status === "ready"} /></label><label>预期产物<input value={taskDraft.expectedOutput} onChange={(event) => setTaskDraft((draft) => ({ ...draft, expectedOutput: event.target.value }))} placeholder="例如：docs/成本分析.md" required={taskDraft.status === "ready"} /></label><div className={styles.contractHint} data-complete={taskDraftMissing.length === 0}>{taskDraftMissing.length === 0 ? "合同完整，可创建为待办事项并交给 Pi。" : `还缺：${taskDraftMissing.join("、")}。未完整的任务只能先存入积压事项。`}</div><label>创建到<select value={taskDraft.status} onChange={(event) => setTaskDraft((draft) => ({ ...draft, status: event.target.value as QueueStatus }))}><option value="backlog">积压事项（可稍后补全）</option><option value="ready">待办事项（需完整合同）</option></select></label><footer><button type="button" onClick={() => setTaskFormOpen(false)}>取消</button><button className={styles.primaryButton} disabled={saving || (taskDraft.status === "ready" && taskDraftMissing.length > 0)}>{saving ? "创建中…" : "创建任务"}</button></footer></form>}
-        {contractEditor && <form className={`${styles.modal} ${styles.taskModal}`} onSubmit={saveContract}><header><div><span>EDIT CONTRACT</span><h2>编辑任务合同</h2></div><button type="button" onClick={() => setContractEditor(null)}>×</button></header><p>当前位于{contractEditor.status === "ready" ? "待办事项" : "积压事项"}，版本 v{contractEditor.version}。保存时会检查是否有人已在其他窗口修改。</p><label>任务标题<input value={contractEditor.title} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, title: event.target.value } : draft)} required /></label><label>目标<textarea value={contractEditor.goal} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, goal: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><label>验收条件<textarea value={contractEditor.acceptanceCriteria} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, acceptanceCriteria: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><label>预期产物<input value={contractEditor.expectedOutput} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, expectedOutput: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><div className={styles.contractHint} data-complete={contractEditorMissing.length === 0}>{contractEditorMissing.length === 0 ? "合同完整，保存后可继续安排。" : `还缺：${contractEditorMissing.join("、")}。`}</div><footer><button type="button" onClick={() => setContractEditor(null)}>取消</button><button className={styles.primaryButton} disabled={saving || (contractEditor.status === "ready" && contractEditorMissing.length > 0)}>{saving ? "保存中…" : "保存合同"}</button></footer></form>}
+      {contractEditor && <div className={styles.modalBackdrop} onMouseDown={(event) => { if (event.target === event.currentTarget) setContractEditor(null); }}>
+        <form className={`${styles.modal} ${styles.taskModal}`} onSubmit={saveContract}><header><div><span>EDIT CONTRACT</span><h2>编辑旧版任务字段</h2></div><button type="button" onClick={() => setContractEditor(null)}>×</button></header><p>这是历史任务的回退入口。当前位于{contractEditor.status === "ready" ? "待办事项" : "积压事项"}，版本 v{contractEditor.version}；新任务请回到对话中整理任务约定。</p><label>任务标题<input value={contractEditor.title} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, title: event.target.value } : draft)} required /></label><label>目标<textarea value={contractEditor.goal} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, goal: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><label>验收条件<textarea value={contractEditor.acceptanceCriteria} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, acceptanceCriteria: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><label>预期产物<input value={contractEditor.expectedOutput} onChange={(event) => setContractEditor((draft) => draft ? { ...draft, expectedOutput: event.target.value } : draft)} required={contractEditor.status === "ready"} /></label><div className={styles.contractHint} data-complete={contractEditorMissing.length === 0}>{contractEditorMissing.length === 0 ? "字段完整，保存后可继续安排。" : `还缺：${contractEditorMissing.join("、")}。`}</div><footer><button type="button" onClick={() => setContractEditor(null)}>取消</button><button className={styles.primaryButton} disabled={saving || (contractEditor.status === "ready" && contractEditorMissing.length > 0)}>{saving ? "保存中…" : "保存字段"}</button></footer></form>
       </div>}
 
-      <span className={styles.srOnly} aria-live="polite">{processingTaskId ? "正在准备任务对话" : ""}</span>
+      <span className={styles.srOnly} aria-live="polite">{framingTaskId ? "正在准备任务澄清对话" : processingTaskId ? "正在准备任务执行对话" : ""}</span>
     </section>
   );
 }

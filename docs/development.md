@@ -53,7 +53,7 @@ To return to normal local data in the same shell, unset the five variables above
 | `.runtime/` | Ignored isolated fixtures, test output, and staged build output. It is not a backup of user data. |
 | `.next/` | Generated Next.js output. It is replaceable program output, not user data. |
 
-Pi Task can read local sessions and selected project files. When a user sends an agent prompt, configured model providers may receive the prompt and relevant tool results. Keep the project local, use the principle of least access, and follow the provider's data policy.
+Pi Task can read local Sessions and files in the selected working directory. When a user sends an agent prompt, configured model providers may receive the prompt and relevant tool results. Keep the workspace local, use the principle of least access, and follow the provider's data policy.
 
 Do not operate Pi Web and Pi Task concurrently on the same active Pi session.
 
@@ -87,7 +87,7 @@ The only documented production-style build is the macOS E2 flow:
 
 It is macOS-only, requires already-installed dependencies, and builds/tests inside `.runtime/` without using real Pi data. It does **not** publish anything and does not promote the build to `.next/`.
 
-The separate E3 promotion step can replace `.next/` and then launch against shared local data. It must only be used after reviewing [Gate E — macOS local delivery](./architecture/gate-e-macos-local.md), confirming there is no active Run, and making an explicit human decision. For day-to-day Dock/PWA use after a verified build, see [macOS Dock/PWA local use](./macos-dock-pwa.md).
+The separate E3 promotion step can replace `.next/` and then launch against shared local data. It must only be used after reviewing [Gate E — macOS local delivery](./architecture/gate-e-macos-local.md), confirming there is no active Run, and making an explicit human decision. The installed-service upgrade path also stops the service, creates a consistent Task SQLite backup under `~/.pi-task-backups/`, and proves the schema migration on a separate copy before promotion; do not bypass that preflight when a release changes Task schema. For day-to-day Dock/PWA use after a verified build, see [macOS Dock/PWA local use](./macos-dock-pwa.md).
 
 ## Before committing
 

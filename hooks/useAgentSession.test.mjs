@@ -47,8 +47,14 @@ test("keeps the session event stream open through the idle grace window", () => 
   assert.match(agentSettledSource, /onAgentEnd\?\.\(\)/);
   assert.match(promptDoneSource, /notifyPromptStage\(runId\)/);
   assert.match(promptDoneSource, /scheduleEventStreamClose\(sid\)/);
-  assert.match(sendSource, /if \(promptRequestStarted && sentSessionId\) \{[\s\S]*?waitForPromptSettlement/);
-  assert.match(sendSource, /if \(promptRequestStarted && sentSessionId\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?closeEvents\(\)/);
+  assert.match(sendSource, /if \(promptRequestStarted && sentSessionId && !definitelyRejected\) \{[\s\S]*?waitForPromptSettlement/);
+  assert.match(sendSource, /if \(promptRequestStarted && sentSessionId && !definitelyRejected\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?closeEvents\(\)/);
+  assert.match(sendSource, /e instanceof AgentCommandRejectedError/);
+  assert.match(source, /activeTaskStartIntentRef\.current = startIntent/);
+  assert.match(sendSource, /taskRunStarted \|\| Boolean\(activeTaskStartIntentRef\.current\)/);
+  assert.match(sendSource, /if \(pendingTaskStart\) onTaskStartFailed\?\.\(/);
+  assert.match(chatWindowSource, /pendingTaskStart, onTaskStarted, onTaskStartFailed/);
+  assert.match(sendSource, /if \(message && !options\?\.programmatic\) opts\.chatInputRef\?\.current\?\.insertIfEmpty\(message\)/);
 });
 
 test("keeps failed model loads actionable and supports an explicit local retry", () => {
@@ -62,6 +68,18 @@ test("keeps failed model loads actionable and supports an explicit local retry",
   assert.match(loadModelsSource, /resolveModelLoadIssue\(res\.status, d\.errorCode\)/);
   assert.match(loadModelsSource, /setModelLoadIssue\("unavailable"\)/);
   assert.match(source, /const refreshModels = useCallback\(\(\) => loadModels\(undefined, true\), \[loadModels\]\)/);
+});
+
+test("assembles Pi 0.84 delta-only assistant updates until authoritative message_end", () => {
+  const messageUpdateSource = source.slice(
+    source.indexOf('case "message_update"'),
+    source.indexOf('case "message_end"'),
+  );
+
+  assert.match(source, /applyAssistantMessageEvent/);
+  assert.match(messageUpdateSource, /event\.assistantMessageEvent/);
+  assert.match(messageUpdateSource, /assistantMessageStreamRef\.current\.message/);
+  assert.match(source, /assistantMessageStreamRef\.current = createAssistantMessageStreamAccumulator\(\)/);
 });
 
 test("reuses an open event stream and hides an empty agent phase", () => {

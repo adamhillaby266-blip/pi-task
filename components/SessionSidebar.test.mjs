@@ -24,6 +24,14 @@ test("does not register row-level session deletion shortcuts", () => {
   assert.doesNotMatch(sessionItemSource, /tabIndex=\{0\}/);
 });
 
+test("presents one working directory with visible rule sources instead of a second Project concept", () => {
+  assert.match(source, /sidebar\.currentDirectory/);
+  assert.match(source, /directoryLabel\(selectedCwd\)/);
+  assert.match(source, /\/api\/workspace-context\?cwd=/);
+  assert.match(source, /sidebar\.rulesNotSandbox/);
+  assert.doesNotMatch(source, /新建项目/);
+});
+
 test("polls running sessions only while the tab is visible", () => {
   assert.doesNotMatch(source, /new EventSource\("\/api\/agent\/running\/events"\)/);
   assert.match(source, /fetch\("\/api\/agent\/running"/);

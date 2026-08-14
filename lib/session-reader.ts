@@ -10,6 +10,7 @@ import type { AgentMessage, SessionEntry, SessionHeader, SessionInfo, SessionCon
 import type { SessionEntry as PiSessionEntry, SessionInfo as PiSessionInfo } from "@earendil-works/pi-coding-agent";
 import { normalizeToolCalls } from "./normalize";
 import { sessionPathKey } from "./session-path";
+import { projectTaskFramingForUi } from "./task/framing-session";
 import { resolveProject, type ProjectInfo } from "./worktree";
 
 export { getAgentDir };
@@ -220,15 +221,25 @@ export function buildSessionContext(
 
   // Convert the SDK-selected context entries and their IDs together. This keeps
   // fork/navigation targets aligned while preserving pi's compaction ordering.
+  // Task Framing drafts are persisted as non-context custom entries. They are
+  // projected only for Pi Task Web and never added to piBuildSessionContext's
+  // model messages.
+  const selectedEntryIds = contextEntries.map((entry) => String(entry.id));
+  const framing = projectTaskFramingForUi(entries, leafId, selectedEntryIds);
   const messages: AgentMessage[] = [];
   const entryIds: string[] = [];
   for (const entry of contextEntries) {
     const localEntry = entry as unknown as SessionEntry;
-    const m = entryToUiMessage(localEntry, options);
+    const projectedFraming = framing.byEntryId.get(localEntry.id);
+    const m = projectedFraming?.message ?? entryToUiMessage(localEntry, options);
     if (m) {
       messages.push(m);
       entryIds.push(localEntry.id);
     }
+  }
+  if (framing.restored) {
+    messages.push(framing.restored.message);
+    entryIds.push(framing.restored.entryId);
   }
 
   return {

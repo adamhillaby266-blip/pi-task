@@ -1,10 +1,10 @@
 # Pi Task 里的 Worktree
 
-Pi Task 会把同一个 Git 项目的 main checkout 和 linked worktree 放在同一个项目下。你可以用它在不同分支之间切换工作目录，同时保留统一的会话列表。
+Pi Task 会把同一个 Git 仓库的 main checkout 和 linked worktree 关联起来。你可以在不同分支之间切换工作目录，同时继续找到相关会话。
 
 ## 什么时候会看到 Worktree 控件
 
-当左上角选择的是 Git 仓库根目录时，项目选择器下面会出现 worktree 切换控件。
+当左上角选择的是 Git 仓库根目录时，工作目录选择器下面会出现 worktree 切换控件。
 
 以下情况不会显示：
 
@@ -12,7 +12,7 @@ Pi Task 会把同一个 Git 项目的 main checkout 和 linked worktree 放在�
 - 当前目录在某个 Git 仓库里面，但不是仓库根目录。
 - Git 无法读取这个仓库的 worktree 列表。
 
-如果你在仓库子目录里，先从项目选择器打开仓库根目录，再管理 worktree。
+如果你在仓库子目录里，先使用工作目录下方的“打开仓库根目录”，再管理 worktree。
 
 ## 切换 Worktree 会影响什么
 
@@ -24,7 +24,7 @@ worktree 切换器决定 Pi Task 接下来使用哪个 checkout。
 - 左侧 Explorer 浏览的文件。
 - 从 Explorer 插入到输入框里的文件路径。
 
-已有会话仍然按同一个 project root 分组。点击一个已有会话时，侧边栏会回到这个会话原本所在的 checkout。
+已有会话仍按仓库根目录在内部归组。点击一个已有会话时，侧边栏会回到这个会话原本所在的 checkout。
 
 ## 新建 Worktree
 
@@ -64,13 +64,13 @@ Pi Task 会把 checkout 放在：
 
 ## 会话和 Worktree 的关系
 
-Pi Task 按 project root 分组会话，所以 main checkout 和 linked worktree 里的会话会显示在一起。
+Pi Task 在内部按仓库根目录归组会话，所以 main checkout 和 linked worktree 里的会话会显示在一起，但用户不需要额外选择 Project。
 
 但每个会话仍然记得自己创建时的 working directory：
 
 - 在某个 worktree 创建的会话，会继续使用那个 worktree path。
 - 在 main checkout 创建的会话，会继续使用 main checkout。
-- 如果某个 worktree 已被删除，它的历史会话仍会显示在项目下，方便你找回上下文。
+- 如果某个 worktree 已被删除，它的历史会话仍会保留，方便你找回上下文。
 
 ## 常见问题
 

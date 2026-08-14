@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { allowFileRoot } from "@/lib/file-access";
 import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
 import { invalidateSessionListCache, resolveSessionPath } from "@/lib/session-reader";
@@ -19,7 +20,11 @@ export interface PreparedTaskSession {
   reused: boolean;
 }
 
-export async function prepareTaskSession(taskId: string, version: number): Promise<PreparedTaskSession> {
+export async function prepareTaskSession(
+  taskId: string,
+  version: number,
+  options: { extensionFactories?: InlineExtension[] } = {},
+): Promise<PreparedTaskSession> {
   const store = getTaskStore();
   const detail = store.getTaskDetail(taskId);
   if (detail.version !== version) {
@@ -60,7 +65,7 @@ export async function prepareTaskSession(taskId: string, version: number): Promi
   }
 
   const binding = createTaskSessionBinding(taskId);
-  const extensionFactories = [createTaskExtension(binding)];
+  const extensionFactories = [createTaskExtension(binding), ...(options.extensionFactories ?? [])];
   const started = sessionFile && sessionId
     ? await startRpcSession(sessionId, sessionFile, undefined, { extensionFactories })
     : await startRpcSession(`__pi_task__${randomUUID()}`, "", detail.project.rootPath, { extensionFactories });

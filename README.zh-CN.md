@@ -20,7 +20,7 @@ Pi Task 仅用于开发者的本机使用。
 - 源码启动器只接受 loopback 主机（`127.0.0.1` 或 `localhost`）；文档中的开发与 macOS 启动路径均使用 `127.0.0.1:30142`；
 - 不支持 LAN、反向代理、互联网部署、Docker 镜像、npm 发布、桌面安装器或 GitHub Release；
 - 不要让 Pi Web 与 Pi Task 同时操作同一个正在执行的 Pi 会话；
-- 你发送提示词后，Pi Task 可能调用本机 Pi 已配置的模型 Provider。提示词、工具结果和选定项目文件的处理应遵循该 Provider 的数据政策。
+- 你发送提示词后，Pi Task 可能调用本机 Pi 已配置的模型 Provider。提示词、工具结果和当前工作目录文件的处理应遵循该 Provider 的数据政策。
 
 ## 从源码启动
 
@@ -43,7 +43,7 @@ npm run dev
 | --- | --- | --- |
 | Pi 会话、模型设置与认证 | `~/.pi/agent` | Pi Task 会读取本机 Pi 状态；你主动使用会话管理、模型或认证操作时，相关本机数据可能被写入。 |
 | Pi Task 数据 | `~/.pi-task/pi-task.sqlite` | 运行时可能同时存在 SQLite 的 WAL/SHM 文件；手工备份前应先退出 Pi Task。 |
-| 项目文件 | 所选项目与会话工作目录 | 文件访问遵循本机项目/会话上下文；只应让 Agent 接触你愿意交给所配置 Provider 处理的内容。 |
+| 工作目录文件 | 当前工作目录与恢复的 Session 目录 | 文件访问遵循本机目录/Session 上下文；只应让 Agent 接触你愿意交给所配置 Provider 处理的内容。 |
 
 做实验或测试时，将 `HOME`、`TMPDIR`、`PI_CODING_AGENT_DIR` 和 `PI_TASK_DATA_DIR` 都设在已忽略的 `.runtime/` 下。不要在 fixture 中使用真实凭据、未发布内容或公司资料。
 

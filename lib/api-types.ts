@@ -59,6 +59,18 @@ export interface ProjectTrustStatus {
   trusted: boolean;
 }
 
+export interface WorkspaceRuleSourceInfo {
+  path: string;
+  scope: "personal" | "current" | "parent";
+}
+
+export interface WorkspaceContextResponse {
+  cwd: string;
+  ruleSources: WorkspaceRuleSourceInfo[];
+  builtInDiscipline: true;
+  systemSandbox: false;
+}
+
 export type PluginScope = "global" | "project";
 export type PluginResourceKind = "extension" | "skill" | "prompt" | "theme";
 

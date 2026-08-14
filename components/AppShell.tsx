@@ -13,7 +13,6 @@ import { PluginsConfig } from "./PluginsConfig";
 import { ProjectTrustDialog } from "./ProjectTrustDialog";
 import { BranchNavigator } from "./BranchNavigator";
 import { TaskBoard, taskPrompt, type PreparedSession } from "./tasks/TaskBoard";
-import { TaskFromConversationDialog } from "./tasks/TaskFromConversationDialog";
 import { useTheme } from "@/hooks/useTheme";
 import { useI18n } from "@/hooks/useI18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -38,7 +37,7 @@ import type { SessionInfo, SessionTreeNode } from "@/lib/types";
 import type { ProjectTrustStatus } from "@/lib/api-types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo } from "@/lib/pi-types";
-import type { RunRecord, TaskDetail, TaskRecord } from "@/lib/task/types";
+import type { RunRecord, TaskDetail, TaskFramingCommitAction, TaskFramingOperationRecord, TaskRecord } from "@/lib/task/types";
 
 type SessionCopyField = "file" | "id";
 type AutoNameStatus =
@@ -49,6 +48,8 @@ type AutoNameStatus =
 
 const TOP_BAR_ICON_BUTTON_SIZE = 36;
 const LANGUAGE_MENU_WIDTH = 176;
+const TASK_FRAMING_INTENT = "我想把当前讨论整理成任务约定。请基于本对话先起草，不要创建 Task 或开始执行；只追问会改变目标、权威来源、范围、权限或结果的问题。";
+const taskStartIntent = (runNumber: number) => `我已确认任务约定并选择现在开始。请按该约定开始 Run ${runNumber}。`;
 const TASK_STATUS_LABELS: Record<TaskRecord["status"], string> = {
   backlog: "积压事项",
   ready: "待办事项",
@@ -84,11 +85,10 @@ export function AppShell() {
   const [mainView, setMainView] = useState<"agent" | "tasks">("agent");
   const [activeTask, setActiveTask] = useState<TaskDetail | null>(null);
   const [resolvedTaskSessionId, setResolvedTaskSessionId] = useState<string | null>(null);
-  const [taskFromConversationOpen, setTaskFromConversationOpen] = useState(false);
   const [taskActionPending, setTaskActionPending] = useState(false);
   const [taskActionError, setTaskActionError] = useState<string | null>(null);
-  const [pendingTaskStart, setPendingTaskStart] = useState<{ taskId: string; version: number } | null>(null);
-  const [pendingTaskPrompt, setPendingTaskPrompt] = useState<string | null>(null);
+  const [pendingTaskStart, setPendingTaskStart] = useState<{ taskId: string; version: number; operationId?: string } | null>(null);
+  const [pendingTaskPrompt, setPendingTaskPrompt] = useState<{ message: string; autoSend: boolean; operationId?: string } | null>(null);
   const [projectTrust, setProjectTrust] = useState<ProjectTrustStatus | null>(null);
   const [projectTrustDialogOpen, setProjectTrustDialogOpen] = useState(false);
   const [projectTrustBusy, setProjectTrustBusy] = useState(false);
@@ -283,6 +283,7 @@ export function AppShell() {
 
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  const [activeWorkspaceRoot, setActiveWorkspaceRoot] = useState<string | null>(null);
   const activeProjectRootRef = useRef<string | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
@@ -326,6 +327,7 @@ export function AppShell() {
 
   const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null) => {
     setActiveCwd(cwd);
+    setActiveWorkspaceRoot(projectRoot ?? cwd ?? null);
     // Skip if cwd is null (initial mount).
     if (!cwd) return;
     const newProject = projectRoot ?? cwd;
@@ -345,12 +347,11 @@ export function AppShell() {
     if (currentProject === newProject) {
       return;
     }
-    // Close any session that belongs to a different project — it no longer
-    // matches the selected project directory.
+    // Close any session that belongs to a different working directory — it no
+    // longer matches the selected workspace context.
     setSelectedSession(null);
     setActiveTask(null);
     setResolvedTaskSessionId(null);
-    setTaskFromConversationOpen(false);
     setTaskActionError(null);
     setPendingTaskStart(null);
     setPendingTaskPrompt(null);
@@ -379,7 +380,6 @@ export function AppShell() {
     setSelectedSession(session);
     setActiveTask(null);
     setResolvedTaskSessionId(null);
-    setTaskFromConversationOpen(false);
     setTaskActionError(null);
     setPendingTaskStart(null);
     setPendingTaskPrompt(null);
@@ -404,7 +404,6 @@ export function AppShell() {
     setSelectedSession(null);
     setActiveTask(null);
     setResolvedTaskSessionId(null);
-    setTaskFromConversationOpen(false);
     setTaskActionError(null);
     setPendingTaskStart(null);
     setPendingTaskPrompt(null);
@@ -417,6 +416,15 @@ export function AppShell() {
     if (isMobile) setSidebarOpen(false);
     router.replace("/", { scroll: false });
   }, [router, isMobile]);
+
+  const handleStartTaskConversation = useCallback(() => {
+    if (!activeCwd) {
+      setTaskActionError("请先从左侧选择工作目录");
+      return;
+    }
+    setMainView("agent");
+    handleNewSession(`task-${Date.now()}`, activeCwd);
+  }, [activeCwd, handleNewSession]);
 
   useEffect(() => {
     const sessionId = selectedSession?.id;
@@ -447,7 +455,11 @@ export function AppShell() {
     return () => { cancelled = true; };
   }, [pendingTaskStart, selectedSession?.id]);
 
-  const handleProcessTask = useCallback((task: TaskDetail, prepared: PreparedSession) => {
+  const handleProcessTask = useCallback((
+    task: TaskDetail,
+    prepared: PreparedSession,
+    options: { autoStartOperationId?: string } = {},
+  ) => {
     const timestamp = new Date().toISOString();
     const taskSession: SessionInfo = {
       id: prepared.sessionId,
@@ -466,10 +478,17 @@ export function AppShell() {
     setRefreshKey((key) => key + 1);
     setActiveTask(task);
     setResolvedTaskSessionId(prepared.sessionId);
-    setTaskFromConversationOpen(false);
     setTaskActionError(null);
-    setPendingTaskStart({ taskId: task.id, version: task.version });
-    setPendingTaskPrompt(taskPrompt(task));
+    setPendingTaskStart({
+      taskId: task.id,
+      version: task.version,
+      ...(options.autoStartOperationId ? { operationId: options.autoStartOperationId } : {}),
+    });
+    setPendingTaskPrompt({
+      message: options.autoStartOperationId ? taskStartIntent(task.runs.length + 1) : taskPrompt(task),
+      autoSend: Boolean(options.autoStartOperationId),
+      ...(options.autoStartOperationId ? { operationId: options.autoStartOperationId } : {}),
+    });
     setMainView("agent");
     setActiveTopPanel(null);
     setBranchTree([]);
@@ -479,11 +498,105 @@ export function AppShell() {
     router.replace(`?session=${encodeURIComponent(prepared.sessionId)}`, { scroll: false });
   }, [isMobile, router]);
 
-  const handleTaskSavedFromConversation = useCallback((task: TaskDetail) => {
-    setActiveTask(task);
-    setResolvedTaskSessionId(task.primarySessionId);
+  const handleFrameTask = useCallback((task: TaskDetail, prepared: PreparedSession) => {
+    const timestamp = new Date().toISOString();
+    const framingSession: SessionInfo = {
+      id: prepared.sessionId,
+      path: prepared.sessionFile,
+      cwd: prepared.cwd,
+      name: task.title,
+      created: timestamp,
+      modified: timestamp,
+      messageCount: 0,
+      firstMessage: task.title,
+      projectRoot: task.project.rootPath,
+    };
+    setSelectedSession(framingSession);
+    setNewSessionCwd(null);
+    setSessionKey((key) => key + 1);
     setRefreshKey((key) => key + 1);
+    setActiveTask(task);
+    setResolvedTaskSessionId(prepared.sessionId);
+    setPendingTaskStart(null);
+    setPendingTaskPrompt(null);
+    setTaskActionError(null);
+    setMainView("agent");
+    setActiveTopPanel(null);
+    setBranchTree([]);
+    setBranchActiveLeafId(null);
+    setSystemPrompt(null);
+    if (isMobile) setSidebarOpen(false);
+    router.replace(`?session=${encodeURIComponent(prepared.sessionId)}`, { scroll: false });
+  }, [isMobile, router]);
+
+  const handleStartTaskFraming = useCallback(() => {
+    setTaskActionError(null);
+    const result = chatInputRef.current?.sendIfEmpty(TASK_FRAMING_INTENT) ?? "invalid";
+    if (result === "sent") return;
+    const message = result === "busy"
+      ? "当前对话仍在回复，请结束后再整理任务约定"
+      : result === "draft_present"
+        ? "输入框已有未发送内容，请先发送或清空"
+        : result === "tools_disabled"
+          ? "当前已关闭工具；请切换到默认或完整工具后再整理任务约定"
+          : "暂时无法发送任务约定请求，请稍后重试";
+    setTaskActionError(message);
   }, []);
+
+  const markTaskFramingStartFailed = useCallback(async (
+    operationId: string,
+    taskId: string,
+    sessionId: string,
+    reason: string,
+  ): Promise<TaskDetail | null> => {
+    try {
+      const response = await fetch("/api/task-framing/start-failed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operationId, taskId, sessionId, reason }),
+      });
+      const body = await response.json().catch(() => ({})) as { task?: TaskDetail };
+      return response.ok && body.task ? body.task : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const handleTaskFramingCommitted = useCallback(async (
+    task: TaskDetail,
+    action: TaskFramingCommitAction,
+    operation: TaskFramingOperationRecord,
+  ) => {
+    const sessionId = task.primarySessionId ?? selectedSession?.id ?? null;
+    setActiveTask(task);
+    setResolvedTaskSessionId(sessionId);
+    setTaskActionError(null);
+    setRefreshKey((key) => key + 1);
+    if (action !== "confirm_and_start") return;
+    if (!sessionId) throw new Error("任务约定已确认，但没有可恢复的主 Session；Task 保持待办");
+
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/prepare`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: task.version }),
+      });
+      const body = await response.json().catch(() => ({})) as {
+        session?: PreparedSession;
+        error?: string | { message?: string };
+      };
+      if (!response.ok || !body.session) {
+        const message = typeof body.error === "string" ? body.error : body.error?.message;
+        throw new Error(message || `HTTP ${response.status}`);
+      }
+      handleProcessTask(task, body.session, { autoStartOperationId: operation.id });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const recovered = await markTaskFramingStartFailed(operation.id, task.id, sessionId, reason);
+      if (recovered) setActiveTask(recovered);
+      throw new Error(`任务约定已确认，但启动准备失败：${reason}。Task 保持待办。`);
+    }
+  }, [handleProcessTask, markTaskFramingStartFailed, selectedSession?.id]);
 
   const handleBoardTaskChanged = useCallback((task: TaskDetail) => {
     setActiveTask((current) => current?.id === task.id ? task : current ?? null);
@@ -519,6 +632,13 @@ export function AppShell() {
   const handleTaskStarted = useCallback(({ task }: { task: TaskRecord; run: RunRecord }) => {
     setPendingTaskStart(null);
     setActiveTask((current) => current?.id === task.id ? { ...current, ...task } : current);
+  }, []);
+
+  const handleTaskStartFailed = useCallback((message: string) => {
+    setPendingTaskStart(null);
+    setPendingTaskPrompt(null);
+    setTaskActionError(`任务没有完成启动：${message}。请在任务面板确认状态后重试。`);
+    setRefreshKey((key) => key + 1);
   }, []);
 
   const handleTaskReview = useCallback(async (action: "accept" | "return", reason?: string) => {
@@ -565,19 +685,52 @@ export function AppShell() {
     if (mainView !== "agent" || !pendingTaskPrompt) return;
     let cancelled = false;
     let attempts = 0;
-    const insert = () => {
+    const applyPrompt = async () => {
       if (cancelled) return;
-      if (chatInputRef.current) {
-        chatInputRef.current.insertIfEmpty(pendingTaskPrompt);
+      const input = chatInputRef.current;
+      if (!input) {
+        attempts += 1;
+        if (attempts < 60) window.setTimeout(() => void applyPrompt(), 50);
+        return;
+      }
+      if (!pendingTaskPrompt.autoSend) {
+        input.insertIfEmpty(pendingTaskPrompt.message);
         setPendingTaskPrompt(null);
         return;
       }
-      attempts += 1;
-      if (attempts < 30) window.setTimeout(insert, 50);
+
+      const result = input.sendIfEmpty(pendingTaskPrompt.message);
+      if (result === "sent") {
+        setPendingTaskPrompt(null);
+        return;
+      }
+      if (result === "busy" && attempts < 60) {
+        attempts += 1;
+        window.setTimeout(() => void applyPrompt(), 50);
+        return;
+      }
+
+      const reason = result === "draft_present"
+        ? "输入框已有未发送内容"
+        : result === "tools_disabled"
+          ? "当前 Session 已关闭工具"
+          : "执行对话暂时无法接收开始消息";
+      const operationId = pendingTaskPrompt.operationId;
+      const taskId = pendingTaskStart?.taskId;
+      const sessionId = selectedSession?.id;
+      if (operationId && taskId && sessionId) {
+        const recovered = await markTaskFramingStartFailed(operationId, taskId, sessionId, reason);
+        if (!cancelled && recovered) setActiveTask(recovered);
+      }
+      if (!cancelled) {
+        setPendingTaskStart(null);
+        setPendingTaskPrompt(null);
+        setTaskActionError(`任务约定已确认，但没有开始执行：${reason}。Task 保持待办。`);
+      }
     };
-    window.setTimeout(insert, 0);
+    window.setTimeout(() => void applyPrompt(), 0);
     return () => { cancelled = true; };
-  }, [mainView, pendingTaskPrompt]);
+  }, [mainView, markTaskFramingStartFailed, pendingTaskPrompt, pendingTaskStart?.taskId, selectedSession?.id]);
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
@@ -1110,7 +1263,7 @@ export function AppShell() {
               }}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3 1.7-5.1A7 7 0 0 1 3 12V8a5 5 0 0 1 5-5h8a5 5 0 0 1 5 5Z" /></svg>
-              {!isMobile && "Agent"}
+              {!isMobile && translate("nav.conversation")}
             </button>
             <button
               type="button"
@@ -1125,7 +1278,7 @@ export function AppShell() {
               }}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16M15 4v16" /></svg>
-              {!isMobile && "任务"}
+              {!isMobile && translate("nav.tasks")}
             </button>
           </div>
           <button
@@ -1761,9 +1914,9 @@ export function AppShell() {
             <span style={{ color: "var(--text-muted)" }}>自由对话</span>
             <button
               type="button"
-              onClick={() => { setTaskActionError(null); setTaskFromConversationOpen(true); }}
-              style={{ marginLeft: "auto", padding: "4px 8px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-panel)", color: "var(--text)", font: "inherit", fontSize: 9, fontWeight: 650, cursor: "pointer" }}
-            >整理为任务</button>
+              onClick={handleStartTaskFraming}
+              style={{ marginLeft: "auto", padding: "4px 8px", border: "1px solid var(--accent)", borderRadius: 6, background: "var(--accent)", color: "white", font: "inherit", fontSize: 9, fontWeight: 650, cursor: "pointer", whiteSpace: "nowrap" }}
+            >一起把任务聊清楚</button>
           </div>
         )}
 
@@ -1805,7 +1958,10 @@ export function AppShell() {
           {mainView === "tasks" ? (
             <TaskBoard
               activeCwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd}
+              workspaceRoot={activeWorkspaceRoot}
+              onStartTaskConversation={handleStartTaskConversation}
               onProcessTask={handleProcessTask}
+              onFrameTask={handleFrameTask}
               onOpenFile={handleOpenLinkedFile}
               onTaskChanged={handleBoardTaskChanged}
             />
@@ -1827,9 +1983,11 @@ export function AppShell() {
               onOpenFile={handleOpenLinkedFile}
               pendingTaskStart={pendingTaskStart}
               onTaskStarted={handleTaskStarted}
+              onTaskStartFailed={handleTaskStartFailed}
               activeTask={activeTask}
               onTaskStateChange={refreshActiveTask}
               onTaskReview={handleTaskReview}
+              onTaskFramingCommitted={handleTaskFramingCommitted}
             />
           ) : initialCwdStatus === "validating" ? (
             <div
@@ -1970,19 +2128,6 @@ export function AppShell() {
         <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" />
       </svg>
     </button>
-    {taskFromConversationOpen && selectedSession && (
-      <TaskFromConversationDialog
-        conversation={{
-          sessionId: selectedSession.id,
-          cwd: selectedSession.cwd,
-          name: selectedSession.name,
-          firstMessage: selectedSession.firstMessage,
-        }}
-        onClose={() => setTaskFromConversationOpen(false)}
-        onTaskSaved={handleTaskSavedFromConversation}
-        onPrepared={handleProcessTask}
-      />
-    )}
     {modelsConfigOpen && <ModelsConfig onClose={() => { setModelsConfigOpen(false); setModelsRefreshKey((k) => k + 1); }} />}
     {projectTrustDialogOpen && projectTrustCwd && (
       <ProjectTrustDialog

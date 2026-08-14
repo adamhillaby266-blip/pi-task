@@ -25,15 +25,32 @@ test("conversation dialog confirms a complete contract and prepares without auto
   assert.match(dialogSource, /预期产物/);
 });
 
-test("Agent shell offers conversion only after Task lookup and same-Session recovery for ready Tasks", () => {
+test("conversation shell keeps Task Framing primary and starts board Tasks as new conversations", () => {
   assert.match(appShellSource, /resolvedTaskSessionId === selectedSession\.id/);
-  assert.match(appShellSource, />整理为任务<\/button>/);
+  assert.match(appShellSource, /const TASK_FRAMING_INTENT = "我想把当前讨论整理成任务约定/);
+  assert.match(appShellSource, /chatInputRef\.current\?\.sendIfEmpty\(TASK_FRAMING_INTENT\)/);
+  assert.match(appShellSource, /当前已关闭工具；请切换到默认或完整工具后再整理任务约定/);
+  assert.match(appShellSource, /onClick=\{handleStartTaskFraming\}/);
+  assert.match(appShellSource, />一起把任务聊清楚<\/button>/);
+  assert.match(appShellSource, /const handleStartTaskConversation = useCallback/);
+  assert.match(appShellSource, /onStartTaskConversation=\{handleStartTaskConversation\}/);
+  assert.doesNotMatch(appShellSource, />直接填写<\/button>/);
+  assert.doesNotMatch(appShellSource, /TaskFromConversationDialog/);
+  assert.match(appShellSource, /onTaskFramingCommitted=\{handleTaskFramingCommitted\}/);
   assert.match(appShellSource, /activeTask\.status === "ready"/);
   assert.match(appShellSource, />\{taskActionPending \? "准备中…" : "继续处理"\}<\/button>/);
+  assert.match(appShellSource, /const handleFrameTask = useCallback/);
+  assert.match(appShellSource, /setPendingTaskStart\(null\)/);
+  assert.match(appShellSource, /setPendingTaskPrompt\(null\)/);
+  assert.match(appShellSource, /onFrameTask=\{handleFrameTask\}/);
+  assert.match(appShellSource, /const handleTaskStartFailed = useCallback/);
+  assert.match(appShellSource, /onTaskStartFailed=\{handleTaskStartFailed\}/);
 });
 
 test("a Run started before prompt dispatch is compensated when dispatch cannot begin", () => {
   assert.match(agentHookSource, /taskRunStarted = Boolean\(await startPendingTask/);
-  assert.match(agentHookSource, /if \(taskRunStarted && !promptRequestStarted\) \{\s*await interruptActiveTaskRun/);
+  assert.match(agentHookSource, /const taskStartNeedsCompensation = taskRunStarted \|\| Boolean\(activeTaskStartIntentRef\.current\)/);
+  assert.match(agentHookSource, /if \(taskStartNeedsCompensation && \(!promptRequestStarted \|\| definitelyRejected\)\) \{\s*await interruptActiveTaskRun/);
+  assert.match(agentHookSource, /AgentCommandRejectedError/);
   assert.match(agentHookSource, /onAgentEnd\?\.\(\)/);
 });

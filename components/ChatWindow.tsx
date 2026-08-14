@@ -16,7 +16,9 @@ import { useAudio } from "@/hooks/useAudio";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import type { SessionStatsInfo } from "@/lib/pi-types";
-import type { RunRecord, TaskDetail, TaskRecord } from "@/lib/task/types";
+import { buildTaskDecisionOptionMessage, type TaskDecisionOptionSelection, type TaskDecisionOptionSendResult } from "@/lib/task/framing-decision";
+import { isTaskFramingCustomMessage } from "@/lib/task/framing-session";
+import type { RunRecord, TaskDetail, TaskFramingCommitAction, TaskFramingOperationRecord, TaskRecord } from "@/lib/task/types";
 import {
   captureScrollDistance,
   getNextVisibleCount,
@@ -39,11 +41,13 @@ interface Props {
   onSessionStatsPanelOpen?: () => void;
   onContextUsageChange?: (usage: { percent: number | null; contextWindow: number; tokens: number | null } | null) => void;
   onOpenFile?: (filePath: string) => void;
-  pendingTaskStart?: { taskId: string; version: number } | null;
+  pendingTaskStart?: { taskId: string; version: number; operationId?: string } | null;
   onTaskStarted?: (result: { task: TaskRecord; run: RunRecord }) => void;
+  onTaskStartFailed?: (message: string) => void;
   activeTask?: TaskDetail | null;
   onTaskStateChange?: () => void | Promise<void>;
   onTaskReview?: (action: "accept" | "return", reason?: string) => Promise<void>;
+  onTaskFramingCommitted?: (task: TaskDetail, action: TaskFramingCommitAction, operation: TaskFramingOperationRecord) => void | Promise<void>;
 }
 
 function phaseLabel(phase: AgentPhase, t: (key: string, params?: Record<string, string | number>) => string): string | null {
@@ -108,7 +112,7 @@ function hasDisplayableProcessMessage(message: AgentMessage): boolean {
   if (message.role === "assistant") {
     return getDisplayableAssistantBlocks(message as AssistantMessage).length > 0;
   }
-  return message.role === "custom";
+  return message.role === "custom" && !isTaskFramingCustomMessage(message);
 }
 
 // A user message normally anchors a turn (user prompt → process → final
@@ -177,7 +181,7 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children, t }: { mes
   );
 }
 
-export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onOpenFile, pendingTaskStart, onTaskStarted, activeTask, onTaskStateChange, onTaskReview }: Props) {
+export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onOpenFile, pendingTaskStart, onTaskStarted, onTaskStartFailed, activeTask, onTaskStateChange, onTaskReview, onTaskFramingCommitted }: Props) {
   const { t } = useI18n();
   const { soundEnabled, onSoundToggle, playDoneSound, unlockAudio } = useAudio();
   const isMobile = useIsMobile();
@@ -223,9 +227,13 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   } = useAgentSession({
     session, newSessionCwd, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsPanelOpen,
-    pendingTaskStart, onTaskStarted,
+    pendingTaskStart, onTaskStarted, onTaskStartFailed,
   });
   const sessionBusy = agentRunning || bashRunning;
+  const handleTaskDecisionOption = useCallback((selection: TaskDecisionOptionSelection): TaskDecisionOptionSendResult => {
+    if (sessionBusy) return "busy";
+    return chatInputRef?.current?.sendIfEmpty(buildTaskDecisionOptionMessage(selection)) ?? "invalid";
+  }, [chatInputRef, sessionBusy]);
   const activeTaskId = activeTask?.id ?? null;
   const taskUiRequestKey = extensionDialog?.id ?? extensionCustomUi?.id ?? null;
 
@@ -605,6 +613,10 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     showTimestamp={showTimestamp}
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
                     sessionId={session?.id ?? sessionIdRef.current ?? undefined}
+                    taskProjectRoot={messageCwd}
+                    taskDecisionOptionsDisabled={sessionBusy}
+                    onTaskDecisionOption={handleTaskDecisionOption}
+                    onTaskFramingCommitted={onTaskFramingCommitted}
                   />
                 );
                 if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
@@ -653,6 +665,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 for (let processIdx = userIdx + 1; processIdx < finalAssistantIdx; processIdx++) {
                   processIndices.push(processIdx);
                 }
+                const framingIndices = processIndices.filter((processIdx) => isTaskFramingCustomMessage(messages[processIdx]));
                 const visibleProcessIndices = processIndices.filter((processIdx) => hasDisplayableProcessMessage(messages[processIdx]));
                 const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
                 const finalSplit = splitFinalAssistantBlocks(finalAssistant);
@@ -689,6 +702,9 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                   );
                 }
 
+                for (const framingIdx of framingIndices) {
+                  rendered.push(renderMessage(framingIdx));
+                }
                 if (finalAnswerMessage) {
                   rendered.push(renderMessage(finalAssistantIdx, { messageOverride: finalAnswerMessage }));
                 }

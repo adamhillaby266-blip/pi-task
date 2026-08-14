@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -19,10 +21,17 @@ test("macOS background upgrade requires an explicit idle confirmation before any
   assert.doesNotMatch(result.stdout, /launchctl|next build/i);
 });
 
-test("macOS background upgrade refuses non-macOS hosts without changing a service", () => {
+test("macOS background upgrade refuses non-macOS hosts without changing a service", (t) => {
+  const fakeBin = mkdtempSync(join(tmpdir(), "pi-task-non-macos-bin-"));
+  const fakeUname = join(fakeBin, "uname");
+  writeFileSync(fakeUname, "#!/bin/sh\nprintf 'Linux\\n'\n");
+  chmodSync(fakeUname, 0o755);
+  t.after(() => rmSync(fakeBin, { recursive: true, force: true }));
+
   const result = spawnSync("bash", [upgradeScript, "--confirm-idle"], {
     cwd: projectRoot,
     encoding: "utf8",
+    env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
   });
 
   assert.notEqual(result.status, 0);
@@ -39,6 +48,10 @@ test("upgrade path isolates the build, proves it foreground first, then restores
   assert.match(source, /launchctl bootout/);
   assert.match(source, /launchctl bootstrap/);
   assert.match(source, /scripts\/status-macos-background-service\.sh/);
+  assert.match(source, /backup-task-data-for-upgrade\.mjs/);
+  assert.match(source, /task-data-backup\.json/);
+  assert.match(source, /service_stopped/);
+  assert.match(source, /restore_service/);
   assert.match(source, /previousDist/);
   assert.doesNotMatch(source, /PI_CODING_AGENT_DIR|PI_TASK_DATA_DIR|HTTP_PROXY|HTTPS_PROXY/);
 });

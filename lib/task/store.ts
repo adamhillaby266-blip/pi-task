@@ -5,26 +5,39 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isPathWithinRoots } from "../path-security.ts";
 import {
+  checkTaskContractReadiness,
+  parseTaskContract,
+  projectTaskContractToLegacyFields,
+  type TaskContractV1,
+} from "./contract.ts";
+import {
   invalidInput,
   invalidTransition,
   notFound,
   TaskDomainError,
   versionConflict,
 } from "./errors.ts";
-import type {
-  ArtifactRecord,
-  CreateProjectInput,
-  CreateTaskInput,
-  EventActor,
-  EventRecord,
-  ProjectRecord,
-  ReviewRecord,
-  ReviewSubmission,
-  RunRecord,
-  TaskDetail,
-  TaskRecord,
-  TaskStatus,
-  UpdateTaskContractInput,
+import {
+  DELEGATION_PROFILES,
+  type ArtifactRecord,
+  type CreateProjectInput,
+  type CreateTaskInput,
+  type DelegationProfile,
+  type DelegationRecord,
+  type DelegationStatus,
+  type DelegationUsage,
+  type EventActor,
+  type EventRecord,
+  type ProjectRecord,
+  type ReviewRecord,
+  type ReviewSubmission,
+  type RunRecord,
+  type TaskDetail,
+  type TaskFramingCommitInput,
+  type TaskFramingOperationRecord,
+  type TaskRecord,
+  type TaskStatus,
+  type UpdateTaskContractInput,
 } from "./types.ts";
 
 type Row = Record<string, unknown>;
@@ -32,7 +45,9 @@ type QueueStatus = "backlog" | "ready";
 type ActiveRunStatus = "starting" | "running" | "waiting_user";
 
 const ACTIVE_RUN_STATUSES = new Set<ActiveRunStatus>(["starting", "running", "waiting_user"]);
+const DELEGATION_PROFILE_SET = new Set<DelegationProfile>(DELEGATION_PROFILES);
 const DEFAULT_SORT_GAP = 1024;
+const TASK_DATABASE_SCHEMA_VERSION = 3;
 
 function now(): string {
   return new Date().toISOString();
@@ -92,6 +107,16 @@ function mapProject(row: Row): ProjectRecord {
   };
 }
 
+function parseStoredContract(value: unknown): TaskContractV1 | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") throw new Error("Stored Task contract must be JSON text");
+  return parseTaskContract(JSON.parse(value) as unknown);
+}
+
+function nullableNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
+}
+
 function mapTask(row: Row): TaskRecord {
   return {
     id: String(row.id),
@@ -106,6 +131,9 @@ function mapTask(row: Row): TaskRecord {
     primarySessionId: nullableText(row.primary_session_id),
     activeRunId: nullableText(row.active_run_id),
     recoveryNote: nullableText(row.recovery_note),
+    contractSchema: nullableNumber(row.contract_schema),
+    contract: parseStoredContract(row.contract_json),
+    contractRevision: Number(row.contract_revision ?? 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -121,8 +149,49 @@ function mapRun(row: Row): RunRecord {
     model: nullableText(row.model),
     error: nullableText(row.error),
     stopReason: nullableText(row.stop_reason),
+    taskVersionAtStart: nullableNumber(row.task_version_at_start),
+    contractRevision: nullableNumber(row.contract_revision),
+    contractSnapshot: parseStoredContract(row.contract_snapshot_json),
     createdAt: String(row.created_at),
     startedAt: nullableText(row.started_at),
+    endedAt: nullableText(row.ended_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function nonNegativeFinite(value: unknown): number {
+  const candidate = Number(value);
+  return Number.isFinite(candidate) && candidate >= 0 ? candidate : 0;
+}
+
+function parseDelegationUsage(value: unknown): DelegationUsage {
+  const parsed = parsePayload(value);
+  const count = (key: keyof DelegationUsage): number => nonNegativeFinite(parsed[key]);
+  return {
+    input: count("input"),
+    output: count("output"),
+    cacheRead: count("cacheRead"),
+    cacheWrite: count("cacheWrite"),
+    totalTokens: count("totalTokens"),
+    cost: count("cost"),
+  };
+}
+
+function mapDelegation(row: Row): DelegationRecord {
+  return {
+    id: String(row.id),
+    batchId: String(row.batch_id),
+    taskId: String(row.task_id),
+    runId: String(row.run_id),
+    profile: String(row.profile) as DelegationProfile,
+    prompt: String(row.prompt),
+    status: String(row.status) as DelegationStatus,
+    model: String(row.model),
+    output: String(row.output),
+    error: nullableText(row.error),
+    usage: parseDelegationUsage(row.usage),
+    createdAt: String(row.created_at),
+    startedAt: String(row.started_at),
     endedAt: nullableText(row.ended_at),
     updatedAt: String(row.updated_at),
   };
@@ -157,6 +226,21 @@ function mapReview(row: Row): ReviewRecord {
   };
 }
 
+function mapTaskFramingOperation(row: Row): TaskFramingOperationRecord {
+  return {
+    id: String(row.id),
+    sessionId: String(row.session_id),
+    sourceEntryId: String(row.source_entry_id),
+    action: String(row.action) as TaskFramingOperationRecord["action"],
+    taskId: nullableText(row.task_id),
+    runId: nullableText(row.run_id),
+    status: String(row.status) as TaskFramingOperationRecord["status"],
+    error: nullableText(row.error),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
 function mapEvent(row: Row): EventRecord {
   return {
     id: Number(row.id),
@@ -178,17 +262,36 @@ export class TaskStore {
     this.filename = filename;
     mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
     this.database = new DatabaseSync(filename);
-    this.database.exec("PRAGMA foreign_keys = ON");
-    this.database.exec("PRAGMA journal_mode = WAL");
-    this.database.exec("PRAGMA busy_timeout = 5000");
-    this.migrate();
+    try {
+      this.database.exec("PRAGMA foreign_keys = ON");
+      this.database.exec("PRAGMA journal_mode = WAL");
+      this.database.exec("PRAGMA busy_timeout = 5000");
+      this.migrate();
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
   }
 
   close(): void {
     this.database.close();
   }
 
+  private ensureColumn(table: "tasks" | "runs", name: string, definition: string): void {
+    const columns = this.database.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (columns.some((column) => String(column.name) === name)) return;
+    this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  }
+
   private migrate(): void {
+    const versionRow = this.database.prepare("PRAGMA user_version").get() as Row;
+    const currentVersion = Number(versionRow.user_version ?? 0);
+    if (currentVersion > TASK_DATABASE_SCHEMA_VERSION) {
+      throw new Error(
+        `Task database schema ${currentVersion} is newer than supported schema ${TASK_DATABASE_SCHEMA_VERSION}`,
+      );
+    }
+
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -235,6 +338,24 @@ export class TaskStore {
         ON runs(task_id)
         WHERE status IN ('starting','running','waiting_user');
 
+      CREATE TABLE IF NOT EXISTS delegations (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        profile TEXT NOT NULL CHECK (profile IN ('scout','analyst','critic')),
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running','succeeded','failed','interrupted','canceled')),
+        model TEXT NOT NULL,
+        output TEXT NOT NULL DEFAULT '',
+        error TEXT,
+        usage TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS artifacts (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -278,9 +399,41 @@ export class TaskStore {
         WHERE primary_session_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS runs_by_task_created
         ON runs(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS delegations_by_task_created
+        ON delegations(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS delegations_by_run_status
+        ON delegations(run_id, status);
       CREATE INDEX IF NOT EXISTS events_by_task_id
         ON events(task_id, id);
-      PRAGMA user_version = 1;
+    `);
+
+    this.ensureColumn("tasks", "contract_schema", "INTEGER");
+    this.ensureColumn("tasks", "contract_json", "TEXT");
+    this.ensureColumn("tasks", "contract_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "task_version_at_start", "INTEGER");
+    this.ensureColumn("runs", "contract_revision", "INTEGER");
+    this.ensureColumn("runs", "contract_snapshot_json", "TEXT");
+
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS task_framing_operations (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        source_entry_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('save_draft','confirm','confirm_and_start')),
+        task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        status TEXT NOT NULL CHECK (status IN (
+          'applying','saved','confirmed','awaiting_start','started','start_failed'
+        )),
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS framing_operations_by_session_updated
+        ON task_framing_operations(session_id, updated_at);
+      CREATE INDEX IF NOT EXISTS framing_operations_by_source
+        ON task_framing_operations(session_id, source_entry_id, action);
+      PRAGMA user_version = ${TASK_DATABASE_SCHEMA_VERSION};
     `);
   }
 
@@ -439,6 +592,7 @@ export class TaskStore {
       ...task,
       project: this.getProject(task.projectId),
       runs: (this.database.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY created_at").all(taskId) as Row[]).map(mapRun),
+      delegations: (this.database.prepare("SELECT * FROM delegations WHERE task_id = ? ORDER BY created_at").all(taskId) as Row[]).map(mapDelegation),
       artifacts: (this.database.prepare("SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at").all(taskId) as Row[]).map(mapArtifact),
       reviews: (this.database.prepare("SELECT * FROM reviews WHERE task_id = ? ORDER BY submitted_at").all(taskId) as Row[]).map(mapReview),
       events: (this.database.prepare("SELECT * FROM events WHERE task_id = ? ORDER BY id").all(taskId) as Row[]).map(mapEvent),
@@ -451,6 +605,9 @@ export class TaskStore {
     if (current.version !== version) versionConflict();
     if (current.status !== "backlog" && current.status !== "ready") {
       invalidTransition("Only backlog and ready tasks can edit their contract");
+    }
+    if (current.contract) {
+      invalidTransition("Rich Task contracts must be revised from their Task Framing Session");
     }
 
     const title = requiredText(input.title, "title", 240);
@@ -487,6 +644,333 @@ export class TaskStore {
     return row ? this.getTaskDetail(String(row.id)) : null;
   }
 
+  getTaskFramingOperation(operationId: string): TaskFramingOperationRecord {
+    const cleanOperationId = requiredText(operationId, "operationId", 256);
+    const row = this.database.prepare("SELECT * FROM task_framing_operations WHERE id = ?").get(cleanOperationId) as Row | undefined;
+    if (!row) notFound(`Task Framing operation '${cleanOperationId}' does not exist`);
+    return mapTaskFramingOperation(row);
+  }
+
+  listTaskFramingOperations(sessionId: string, sourceEntryId?: string): TaskFramingOperationRecord[] {
+    const cleanSessionId = requiredText(sessionId, "sessionId", 256);
+    const cleanSourceEntryId = sourceEntryId === undefined
+      ? undefined
+      : requiredText(sourceEntryId, "sourceEntryId", 128);
+    const rows = cleanSourceEntryId
+      ? this.database.prepare(`
+          SELECT * FROM task_framing_operations
+          WHERE session_id = ? AND source_entry_id = ?
+          ORDER BY created_at
+        `).all(cleanSessionId, cleanSourceEntryId) as Row[]
+      : this.database.prepare(`
+          SELECT * FROM task_framing_operations
+          WHERE session_id = ?
+          ORDER BY created_at
+        `).all(cleanSessionId) as Row[];
+    return rows.map(mapTaskFramingOperation);
+  }
+
+  prepareTaskFramingStart(operationId: string, taskId: string, sessionId?: string): TaskFramingOperationRecord {
+    const operation = this.getTaskFramingOperation(operationId);
+    if (operation.taskId !== taskId || operation.action !== "confirm_and_start") {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent does not belong to this Task", 409);
+    }
+    if (sessionId && operation.sessionId !== sessionId) {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent does not belong to this Task", 409);
+    }
+    if (operation.status !== "awaiting_start" && operation.status !== "started") {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent is no longer active", 409);
+    }
+    return operation;
+  }
+
+  markTaskFramingOperationStarted(operationId: string, taskId: string, runId: string): TaskFramingOperationRecord {
+    const operation = this.prepareTaskFramingStart(operationId, taskId);
+    if (operation.status === "started") {
+      if (operation.runId !== runId) {
+        throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent already created a different Run", 409);
+      }
+      return operation;
+    }
+    const run = this.getRun(runId);
+    if (run.taskId !== taskId || run.status !== "running") {
+      throw new TaskDomainError("RUN_NOT_ACTIVE", "The Run is not active for this start intent", 409);
+    }
+    const timestamp = now();
+    const update = this.database.prepare(`
+      UPDATE task_framing_operations
+      SET run_id = ?, status = 'started', error = NULL, updated_at = ?
+      WHERE id = ? AND task_id = ? AND action = 'confirm_and_start' AND status = 'awaiting_start'
+    `).run(runId, timestamp, operationId, taskId);
+    if (Number(update.changes) !== 1) {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent changed before the Run was linked", 409);
+    }
+    return this.getTaskFramingOperation(operationId);
+  }
+
+  markTaskFramingOperationStartFailed(operationId: string, reason: string): TaskFramingOperationRecord {
+    const operation = this.getTaskFramingOperation(operationId);
+    if (operation.action !== "confirm_and_start") {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The operation is not a start intent", 409);
+    }
+    if (operation.status === "start_failed") return operation;
+    if (operation.status !== "awaiting_start" && operation.status !== "started") {
+      throw new TaskDomainError("START_INTENT_EXPIRED", "The start intent cannot be failed from its current state", 409);
+    }
+    const message = requiredText(reason, "reason", 10_000);
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE task_framing_operations
+      SET status = 'start_failed', error = ?, updated_at = ?
+      WHERE id = ? AND status IN ('awaiting_start','started')
+    `).run(message, timestamp, operationId);
+    return this.getTaskFramingOperation(operationId);
+  }
+
+  commitTaskFraming(input: TaskFramingCommitInput): { task: TaskDetail; operation: TaskFramingOperationRecord } {
+    const operationId = requiredText(input.operationId, "operationId", 256);
+    const sessionId = requiredText(input.sessionId, "sessionId", 256);
+    const sourceEntryId = requiredText(input.sourceEntryId, "sourceEntryId", 128);
+    const projectId = requiredText(input.projectId, "projectId", 256);
+    const taskId = input.taskId === null ? null : requiredText(input.taskId, "taskId", 256);
+    const expectedTaskVersion = input.expectedTaskVersion;
+    if (expectedTaskVersion !== null && (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 1)) {
+      invalidInput("expectedTaskVersion must be null or a positive integer");
+    }
+    const action = input.action;
+    if (action !== "save_draft" && action !== "confirm" && action !== "confirm_and_start") {
+      invalidInput("Unsupported Task Framing action");
+    }
+    const contract = parseTaskContract(input.contract);
+    const readiness = checkTaskContractReadiness(contract);
+    if (action !== "save_draft" && !readiness.ready) {
+      throw new TaskDomainError("CONTRACT_NOT_READY", "Resolve every blocking Task contract check before confirming", 409);
+    }
+    const projection = projectTaskContractToLegacyFields(contract);
+    const contractJson = JSON.stringify(contract);
+    this.getProject(projectId);
+
+    const existingRow = this.database.prepare("SELECT * FROM task_framing_operations WHERE id = ?").get(operationId) as Row | undefined;
+    if (existingRow) {
+      const existing = mapTaskFramingOperation(existingRow);
+      if (
+        existing.sessionId !== sessionId
+        || existing.sourceEntryId !== sourceEntryId
+        || existing.action !== action
+        || (taskId !== null && existing.taskId !== taskId)
+      ) {
+        throw new TaskDomainError("INVALID_INPUT", "operationId was already used for a different Task Framing request", 409);
+      }
+      if (!existing.taskId) {
+        throw new TaskDomainError("INVALID_TRANSITION", "The existing Task Framing operation has no Task result", 409);
+      }
+      if (action === "confirm_and_start" && existing.status === "start_failed") {
+        const timestamp = now();
+        this.database.prepare(`
+          UPDATE task_framing_operations
+          SET status = 'awaiting_start', run_id = NULL, error = NULL, updated_at = ?
+          WHERE id = ? AND status = 'start_failed'
+        `).run(timestamp, operationId);
+        return { task: this.getTaskDetail(existing.taskId), operation: this.getTaskFramingOperation(operationId) };
+      }
+      return { task: this.getTaskDetail(existing.taskId), operation: existing };
+    }
+
+    const bound = this.findTaskByPrimarySessionId(sessionId);
+    if (bound && taskId && bound.id !== taskId) {
+      throw new TaskDomainError("SESSION_ALREADY_BOUND", `This Session is already bound to Task ${bound.id}`, 409);
+    }
+    let current = taskId ? this.getTask(taskId) : bound;
+    if (current && current.projectId !== projectId) {
+      throw new TaskDomainError("INVALID_INPUT", "The selected Task belongs to a different Project", 409);
+    }
+    if (current && current.primarySessionId && current.primarySessionId !== sessionId) {
+      throw new TaskDomainError("SESSION_ALREADY_BOUND", "The selected Task is bound to another Session", 409);
+    }
+    if (current) {
+      if (expectedTaskVersion === null) invalidInput("expectedTaskVersion is required for an existing Task");
+      if (current.version !== expectedTaskVersion) versionConflict();
+      if (current.status !== "backlog" && current.status !== "ready") {
+        invalidTransition("Only backlog and ready Tasks can commit a candidate contract");
+      }
+      if (current.activeRunId) {
+        throw new TaskDomainError("ACTIVE_RUN_EXISTS", "The Task has an active Run and cannot change its contract", 409);
+      }
+    } else if (expectedTaskVersion !== null) {
+      invalidInput("expectedTaskVersion must be null when creating a Task");
+    }
+
+    const targetStatus: QueueStatus = action === "save_draft" ? "backlog" : "ready";
+    const timestamp = now();
+    try {
+      const result = this.transaction(() => {
+        this.database.prepare(`
+          INSERT INTO task_framing_operations (
+            id, session_id, source_entry_id, action, status, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'applying', ?, ?)
+        `).run(operationId, sessionId, sourceEntryId, action, timestamp, timestamp);
+
+        let nextTask: TaskRecord;
+        if (!current) {
+          const nextTaskId = id("tsk");
+          const max = this.database.prepare(
+            "SELECT MAX(sort_order) AS value FROM tasks WHERE project_id = ? AND status = ?",
+          ).get(projectId, targetStatus) as Row;
+          const sortOrder = Number.isFinite(Number(max.value)) ? Number(max.value) + DEFAULT_SORT_GAP : DEFAULT_SORT_GAP;
+          this.database.prepare(`
+            INSERT INTO tasks (
+              id, project_id, title, goal, acceptance_criteria, expected_output,
+              status, sort_order, version, primary_session_id,
+              contract_schema, contract_json, contract_revision,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, 1, ?, ?)
+          `).run(
+            nextTaskId,
+            projectId,
+            contract.title,
+            projection.goal,
+            projection.acceptanceCriteria,
+            projection.expectedOutput,
+            targetStatus,
+            sortOrder,
+            sessionId,
+            contractJson,
+            timestamp,
+            timestamp,
+          );
+          nextTask = this.getTask(nextTaskId);
+          this.event(nextTaskId, null, "user", "task.created", {
+            status: targetStatus,
+            source: "task_framing",
+            sessionId,
+            operationId,
+          }, nextTask.version, timestamp);
+          this.event(nextTaskId, null, "user", "task.primary_session_bound", {
+            sessionId,
+            sourceDraftEntryId: sourceEntryId,
+          }, nextTask.version, timestamp);
+        } else {
+          const previous = current;
+          const bodyChanged = previous.contract === null || JSON.stringify(previous.contract) !== contractJson;
+          const bindingChanged = previous.primarySessionId !== sessionId;
+          const fieldsChanged = bodyChanged
+            || previous.title !== contract.title
+            || previous.goal !== projection.goal
+            || previous.acceptanceCriteria !== projection.acceptanceCriteria
+            || previous.expectedOutput !== projection.expectedOutput;
+          const statusChanged = previous.status !== targetStatus;
+          const changed = fieldsChanged || statusChanged || bindingChanged;
+          const nextVersion = changed ? previous.version + 1 : previous.version;
+          const nextContractRevision = bodyChanged ? previous.contractRevision + 1 : previous.contractRevision;
+          const update = this.database.prepare(`
+            UPDATE tasks SET
+              title = ?, goal = ?, acceptance_criteria = ?, expected_output = ?,
+              status = ?, primary_session_id = ?, recovery_note = NULL,
+              contract_schema = 1, contract_json = ?, contract_revision = ?,
+              version = ?, updated_at = ?
+            WHERE id = ? AND version = ? AND status IN ('backlog','ready') AND active_run_id IS NULL
+          `).run(
+            contract.title,
+            projection.goal,
+            projection.acceptanceCriteria,
+            projection.expectedOutput,
+            targetStatus,
+            sessionId,
+            contractJson,
+            nextContractRevision,
+            nextVersion,
+            timestamp,
+            previous.id,
+            previous.version,
+          );
+          if (Number(update.changes) !== 1) versionConflict();
+          nextTask = this.getTask(previous.id);
+          if (bindingChanged) {
+            this.event(previous.id, null, "user", "task.primary_session_bound", {
+              sessionId,
+              sourceDraftEntryId: sourceEntryId,
+            }, nextTask.version, timestamp);
+          }
+        }
+
+        const contractEvent = action === "save_draft" ? "task.contract_saved" : "task.contract_confirmed";
+        this.event(nextTask.id, null, "user", contractEvent, {
+          operationId,
+          sourceDraftEntryId: sourceEntryId,
+          contractRevision: nextTask.contractRevision,
+          status: targetStatus,
+        }, nextTask.version, timestamp);
+        if (action === "confirm_and_start") {
+          this.event(nextTask.id, null, "user", "run.start_requested", {
+            operationId,
+            sourceDraftEntryId: sourceEntryId,
+            contractRevision: nextTask.contractRevision,
+          }, nextTask.version, timestamp);
+        }
+        const operationStatus = action === "save_draft"
+          ? "saved"
+          : action === "confirm"
+            ? "confirmed"
+            : "awaiting_start";
+        this.database.prepare(`
+          UPDATE task_framing_operations
+          SET task_id = ?, status = ?, updated_at = ?
+          WHERE id = ? AND status = 'applying'
+        `).run(nextTask.id, operationStatus, timestamp, operationId);
+        return {
+          task: this.getTaskDetail(nextTask.id),
+          operation: this.getTaskFramingOperation(operationId),
+        };
+      });
+      current = result.task;
+      return result;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("tasks.primary_session_id")) {
+        throw new TaskDomainError("SESSION_ALREADY_BOUND", "This Session is already bound to another Task", 409);
+      }
+      throw error;
+    }
+  }
+
+  bindTaskPrimarySession(taskId: string, version: number, sessionId: string): TaskDetail {
+    if (!Number.isInteger(version) || version < 1) invalidInput("version must be a positive integer");
+    const cleanSessionId = requiredText(sessionId, "sessionId", 256);
+    const task = this.getTask(taskId);
+    if (task.version !== version) versionConflict();
+    if (task.status !== "backlog" && task.status !== "ready") {
+      invalidTransition("Only backlog and ready Tasks can bind a Framing Session");
+    }
+    if (task.activeRunId) throw new TaskDomainError("ACTIVE_RUN_EXISTS", "The Task has an active Run", 409);
+    if (task.primarySessionId === cleanSessionId) return this.getTaskDetail(taskId);
+    if (task.primarySessionId) {
+      throw new TaskDomainError("SESSION_ALREADY_BOUND", "The Task is already bound to another Session", 409);
+    }
+    const claimed = this.database.prepare("SELECT id FROM tasks WHERE primary_session_id = ?").get(cleanSessionId) as Row | undefined;
+    if (claimed) throw new TaskDomainError("SESSION_ALREADY_BOUND", "The Session is already bound to another Task", 409);
+    const timestamp = now();
+    try {
+      return this.transaction(() => {
+        const result = this.database.prepare(`
+          UPDATE tasks SET primary_session_id = ?, version = version + 1, updated_at = ?
+          WHERE id = ? AND version = ? AND primary_session_id IS NULL
+            AND status IN ('backlog','ready') AND active_run_id IS NULL
+        `).run(cleanSessionId, timestamp, taskId, version);
+        if (Number(result.changes) !== 1) versionConflict();
+        const next = this.getTask(taskId);
+        this.event(taskId, null, "user", "task.primary_session_bound", {
+          sessionId: cleanSessionId,
+          source: "framing_session",
+        }, next.version, timestamp);
+        return this.getTaskDetail(taskId);
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("tasks.primary_session_id")) {
+        throw new TaskDomainError("SESSION_ALREADY_BOUND", "The Session is already bound to another Task", 409);
+      }
+      throw error;
+    }
+  }
+
   moveQueuedTask(taskId: string, version: number, status: QueueStatus, sortOrder?: number): TaskRecord {
     if (!Number.isInteger(version) || version < 1) invalidInput("version must be a positive integer");
     if (status !== "backlog" && status !== "ready") invalidInput("Queue moves support only backlog and ready");
@@ -495,7 +979,12 @@ export class TaskStore {
     if (task.status !== "backlog" && task.status !== "ready") {
       invalidTransition("Only backlog and ready tasks can be moved without a business action");
     }
-    if (status === "ready") this.assertReadyContract(task.goal, task.acceptanceCriteria, task.expectedOutput);
+    if (status === "ready") {
+      this.assertReadyContract(task.goal, task.acceptanceCriteria, task.expectedOutput);
+      if (task.contract && !checkTaskContractReadiness(task.contract).ready) {
+        throw new TaskDomainError("CONTRACT_NOT_READY", "Resolve every blocking rich contract check before moving this Task to ready", 409);
+      }
+    }
     const targetOrder = sortOrder === undefined
       ? this.nextSortOrder(task.projectId, status, task.id)
       : Number(sortOrder);
@@ -534,6 +1023,9 @@ export class TaskStore {
     if (task.status !== "ready") invalidTransition("Only a ready task can start");
     if (task.activeRunId) throw new TaskDomainError("ACTIVE_RUN_EXISTS", "Task already has an active run", 409);
     this.assertReadyContract(task.goal, task.acceptanceCriteria, task.expectedOutput);
+    if (task.contract && !checkTaskContractReadiness(task.contract).ready) {
+      throw new TaskDomainError("CONTRACT_NOT_READY", "The rich Task contract is not ready to start", 409);
+    }
     const project = this.getProject(task.projectId);
     const cwd = options.cwd ? realpathSync(resolve(options.cwd)) : project.rootPath;
     if (!statSync(cwd).isDirectory() || !isPathWithinRoots(cwd, new Set([project.rootPath]))) {
@@ -546,9 +1038,22 @@ export class TaskStore {
     return this.transaction(() => {
       this.database.prepare(`
         INSERT INTO runs (
-          id, task_id, status, cwd, model, capability_hash, created_at, updated_at
-        ) VALUES (?, ?, 'starting', ?, ?, ?, ?, ?)
-      `).run(runId, taskId, cwd, options.model ?? null, capabilityHash(capability).toString("hex"), timestamp, timestamp);
+          id, task_id, status, cwd, model, capability_hash,
+          task_version_at_start, contract_revision, contract_snapshot_json,
+          created_at, updated_at
+        ) VALUES (?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId,
+        taskId,
+        cwd,
+        options.model ?? null,
+        capabilityHash(capability).toString("hex"),
+        task.version,
+        task.contract ? task.contractRevision : null,
+        task.contract ? JSON.stringify(task.contract) : null,
+        timestamp,
+        timestamp,
+      );
       const result = this.database.prepare(`
         UPDATE tasks SET status = 'in_progress', active_run_id = ?,
           recovery_note = NULL, version = version + 1, updated_at = ?
@@ -580,6 +1085,145 @@ export class TaskStore {
     const row = this.database.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as Row | undefined;
     if (!row) notFound(`Run '${runId}' does not exist`);
     return mapRun(row);
+  }
+
+  beginDelegationBatch(
+    runId: string,
+    capability: string,
+    requests: Array<{ profile: DelegationProfile; prompt: string }>,
+    model: string,
+  ): DelegationRecord[] {
+    const run = this.assertRunCapability(runId, capability);
+    if (run.status !== "running") invalidTransition("Only a running task run can delegate analysis");
+    const task = this.getTask(run.taskId);
+    if (task.activeRunId !== runId || task.status !== "in_progress") {
+      throw new TaskDomainError("RUN_NOT_ACTIVE", "Run is no longer active for this task", 409);
+    }
+    if (!Array.isArray(requests) || requests.length < 2 || requests.length > 4) {
+      invalidInput("A delegation batch requires 2 to 4 read-only agents");
+    }
+    const active = this.database.prepare(
+      "SELECT COUNT(*) AS value FROM delegations WHERE run_id = ? AND status = 'running'",
+    ).get(runId) as Row;
+    if (Number(active.value) > 0) invalidTransition("A delegation batch is already running");
+
+    const cleanModel = requiredText(model, "model", 512);
+    const cleanRequests = requests.map((request) => {
+      if (!DELEGATION_PROFILE_SET.has(request.profile)) invalidInput("Unknown delegation profile");
+      return {
+        profile: request.profile,
+        prompt: requiredText(request.prompt, "delegation.prompt", 100_000),
+      };
+    });
+    const batchId = id("dlg_batch");
+    const timestamp = now();
+    const delegationIds = cleanRequests.map(() => id("dlg"));
+
+    this.transaction(() => {
+      for (let index = 0; index < cleanRequests.length; index += 1) {
+        const request = cleanRequests[index];
+        this.database.prepare(`
+          INSERT INTO delegations (
+            id, batch_id, task_id, run_id, profile, prompt, status, model,
+            output, usage, created_at, started_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, '', '{}', ?, ?, ?)
+        `).run(
+          delegationIds[index],
+          batchId,
+          task.id,
+          runId,
+          request.profile,
+          request.prompt,
+          cleanModel,
+          timestamp,
+          timestamp,
+          timestamp,
+        );
+      }
+      this.event(task.id, runId, "agent", "delegation.started", {
+        batchId,
+        count: cleanRequests.length,
+        profiles: cleanRequests.map((request) => request.profile),
+        model: cleanModel,
+      }, task.version, timestamp);
+    });
+
+    return delegationIds.map((delegationId) => this.getDelegation(delegationId));
+  }
+
+  getDelegation(delegationId: string): DelegationRecord {
+    const row = this.database.prepare("SELECT * FROM delegations WHERE id = ?").get(delegationId) as Row | undefined;
+    if (!row) notFound(`Delegation '${delegationId}' does not exist`);
+    return mapDelegation(row);
+  }
+
+  finishDelegation(
+    delegationId: string,
+    capability: string,
+    result: {
+      status: "succeeded" | "failed" | "canceled";
+      output?: string;
+      error?: string;
+      usage?: Partial<DelegationUsage>;
+    },
+  ): DelegationRecord {
+    const delegation = this.getDelegation(delegationId);
+    const run = this.assertRunCapability(delegation.runId, capability);
+    if (run.status !== "running") throw new TaskDomainError("RUN_NOT_ACTIVE", "Parent run is no longer running", 409);
+    const task = this.getTask(run.taskId);
+    if (task.activeRunId !== run.id || task.status !== "in_progress") {
+      throw new TaskDomainError("RUN_NOT_ACTIVE", "Parent run is no longer active", 409);
+    }
+    const output = optionalText(result.output, "delegation.output", 200_000);
+    const error = optionalText(result.error, "delegation.error", 10_000) || null;
+    const usage: DelegationUsage = {
+      input: nonNegativeFinite(result.usage?.input),
+      output: nonNegativeFinite(result.usage?.output),
+      cacheRead: nonNegativeFinite(result.usage?.cacheRead),
+      cacheWrite: nonNegativeFinite(result.usage?.cacheWrite),
+      totalTokens: nonNegativeFinite(result.usage?.totalTokens),
+      cost: nonNegativeFinite(result.usage?.cost),
+    };
+    const timestamp = now();
+    this.transaction(() => {
+      const update = this.database.prepare(`
+        UPDATE delegations SET status = ?, output = ?, error = ?, usage = ?,
+          ended_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(result.status, output, error, JSON.stringify(usage), timestamp, timestamp, delegationId);
+      if (Number(update.changes) !== 1) {
+        throw new TaskDomainError("RUN_NOT_ACTIVE", "Delegation is no longer active", 409);
+      }
+      this.event(task.id, run.id, "system", `delegation.${result.status}`, {
+        batchId: delegation.batchId,
+        delegationId,
+        profile: delegation.profile,
+        outputBytes: Buffer.byteLength(output, "utf8"),
+        ...(error ? { error } : {}),
+      }, task.version, timestamp);
+    });
+    return this.getDelegation(delegationId);
+  }
+
+  private failStartedFramingOperation(runId: string, reason: string, timestamp: string): void {
+    this.database.prepare(`
+      UPDATE task_framing_operations
+      SET status = 'start_failed', error = ?, updated_at = ?
+      WHERE run_id = ? AND action = 'confirm_and_start' AND status = 'started'
+    `).run(reason, timestamp, runId);
+  }
+
+  private settleActiveDelegations(
+    runId: string,
+    status: "failed" | "interrupted" | "canceled",
+    reason: string,
+    timestamp: string,
+  ): number {
+    const result = this.database.prepare(`
+      UPDATE delegations SET status = ?, error = ?, ended_at = ?, updated_at = ?
+      WHERE run_id = ? AND status = 'running'
+    `).run(status, reason, timestamp, timestamp, runId);
+    return Number(result.changes);
   }
 
   markRunRunning(runId: string, sessionId: string): { task: TaskRecord; run: RunRecord } {
@@ -652,6 +1296,7 @@ export class TaskStore {
     const timestamp = now();
     return this.transaction(() => {
       let stoppedRunId: string | null = null;
+      let stoppedDelegationCount = 0;
       if (task.status === "in_progress") {
         if (!task.activeRunId) throw new TaskDomainError("RUN_NOT_ACTIVE", "In-progress task has no active run", 409);
         const run = this.getRun(task.activeRunId);
@@ -664,6 +1309,7 @@ export class TaskStore {
         `).run(blockReason, timestamp, timestamp, run.id);
         if (Number(stopped.changes) !== 1) throw new TaskDomainError("RUN_NOT_ACTIVE", "Task run changed before it could be blocked", 409);
         stoppedRunId = run.id;
+        stoppedDelegationCount = this.settleActiveDelegations(run.id, "interrupted", blockReason, timestamp);
       }
 
       const result = this.database.prepare(`
@@ -674,7 +1320,11 @@ export class TaskStore {
       if (Number(result.changes) !== 1) versionConflict();
       const nextTask = this.getTask(taskId);
       if (stoppedRunId) {
-        this.event(taskId, stoppedRunId, "user", "run.interrupted", { reason: blockReason, recovery: "blocked" }, nextTask.version, timestamp);
+        this.event(taskId, stoppedRunId, "user", "run.interrupted", {
+          reason: blockReason,
+          recovery: "blocked",
+          stoppedDelegationCount,
+        }, nextTask.version, timestamp);
       }
       this.event(taskId, stoppedRunId, "user", "task.blocked", { reason: blockReason }, nextTask.version, timestamp);
       return this.getTaskDetail(taskId);
@@ -714,6 +1364,7 @@ export class TaskStore {
     const timestamp = now();
     return this.transaction(() => {
       let stoppedRunId: string | null = null;
+      let stoppedDelegationCount = 0;
       if (task.status === "in_progress") {
         if (!task.activeRunId) throw new TaskDomainError("RUN_NOT_ACTIVE", "In-progress task has no active run", 409);
         const run = this.getRun(task.activeRunId);
@@ -726,6 +1377,7 @@ export class TaskStore {
         `).run(cancelReason, timestamp, timestamp, run.id);
         if (Number(stopped.changes) !== 1) throw new TaskDomainError("RUN_NOT_ACTIVE", "Task run changed before it could be canceled", 409);
         stoppedRunId = run.id;
+        stoppedDelegationCount = this.settleActiveDelegations(run.id, "canceled", cancelReason, timestamp);
       }
 
       const result = this.database.prepare(`
@@ -736,7 +1388,10 @@ export class TaskStore {
       if (Number(result.changes) !== 1) versionConflict();
       const nextTask = this.getTask(taskId);
       if (stoppedRunId) {
-        this.event(taskId, stoppedRunId, "user", "run.canceled", { reason: cancelReason }, nextTask.version, timestamp);
+        this.event(taskId, stoppedRunId, "user", "run.canceled", {
+          reason: cancelReason,
+          stoppedDelegationCount,
+        }, nextTask.version, timestamp);
       }
       this.event(taskId, stoppedRunId, "user", "task.canceled", { reason: cancelReason }, nextTask.version, timestamp);
       return this.getTaskDetail(taskId);
@@ -753,6 +1408,8 @@ export class TaskStore {
     const status = interrupted ? "interrupted" : "failed";
     const timestamp = now();
     return this.transaction(() => {
+      const stoppedDelegationCount = this.settleActiveDelegations(runId, status, message, timestamp);
+      this.failStartedFramingOperation(runId, message, timestamp);
       this.database.prepare(`
         UPDATE runs SET status = ?, error = ?, stop_reason = ?, ended_at = ?, updated_at = ?
         WHERE id = ? AND status IN ('starting','running','waiting_user')
@@ -764,7 +1421,10 @@ export class TaskStore {
       `).run(message, timestamp, task.id, runId);
       if (Number(result.changes) !== 1) throw new TaskDomainError("RUN_NOT_ACTIVE", "Run is no longer active", 409);
       const nextTask = this.getTask(task.id);
-      this.event(task.id, runId, "system", `run.${status}`, { reason: message }, nextTask.version, timestamp);
+      this.event(task.id, runId, "system", `run.${status}`, {
+        reason: message,
+        stoppedDelegationCount,
+      }, nextTask.version, timestamp);
       return { task: nextTask, run: this.getRun(runId) };
     });
   }
@@ -779,6 +1439,12 @@ export class TaskStore {
       throw new TaskDomainError("RUN_NOT_ACTIVE", "Run is no longer active for this task", 409);
     }
     const project = this.getProject(task.projectId);
+    const activeDelegations = this.database.prepare(
+      "SELECT COUNT(*) AS value FROM delegations WHERE run_id = ? AND status = 'running'",
+    ).get(runId) as Row;
+    if (Number(activeDelegations.value) > 0) {
+      invalidTransition("Wait for delegated agents to finish before submitting a review");
+    }
     const summary = requiredText(submission.summary, "summary", 100_000);
     const changes = requiredText(submission.changes, "changes", 100_000);
     const verification = requiredText(submission.verification, "verification", 100_000);
@@ -904,6 +1570,8 @@ export class TaskStore {
       for (const row of activeRuns) {
         const run = mapRun(row);
         const task = this.getTask(run.taskId);
+        const stoppedDelegationCount = this.settleActiveDelegations(run.id, "interrupted", message, timestamp);
+        this.failStartedFramingOperation(run.id, message, timestamp);
         this.database.prepare(`
           UPDATE runs SET status = 'interrupted', stop_reason = ?, ended_at = ?, updated_at = ?
           WHERE id = ? AND status IN ('starting','running','waiting_user')
@@ -915,7 +1583,11 @@ export class TaskStore {
         `).run(message, timestamp, task.id, run.id);
         if (Number(result.changes) === 1) {
           const nextTask = this.getTask(task.id);
-          this.event(task.id, run.id, "system", "run.interrupted", { reason: message, recovery: "restart" }, nextTask.version, timestamp);
+          this.event(task.id, run.id, "system", "run.interrupted", {
+            reason: message,
+            recovery: "restart",
+            stoppedDelegationCount,
+          }, nextTask.version, timestamp);
           reconciled += 1;
         }
       }

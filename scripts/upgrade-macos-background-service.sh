@@ -89,6 +89,9 @@ start_background_service() {
 promotion_pid=''
 previous_dist=''
 marker_file=''
+promotion_result=''
+service_stopped=0
+upgrade_succeeded=0
 cleanup_foreground() {
   if [[ -n "$promotion_pid" ]] && kill -0 "$promotion_pid" 2>/dev/null; then
     kill -TERM "$promotion_pid" 2>/dev/null || true
@@ -99,7 +102,7 @@ cleanup_foreground() {
 
 load_previous_dist() {
   previous_dist=''
-  [[ -f "$promotion_result" ]] || return 0
+  [[ -n "$promotion_result" && -f "$promotion_result" ]] || return 0
   previous_dist="$(node - "$promotion_result" <<'NODE'
 const { readFileSync } = require("node:fs");
 try {
@@ -128,6 +131,7 @@ restore_service() {
   fi
 
   if start_background_service && wait_for_page '200' 45; then
+    service_stopped=0
     printf '已恢复 Pi Task 后台服务。\n' >&2
   else
     printf '无法自动恢复后台服务；请查看日志：%s/Library/Logs/Pi Task/pi-task-error.log\n' "$home_dir" >&2
@@ -135,10 +139,18 @@ restore_service() {
 }
 
 cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
   cleanup_foreground
   [[ -z "$marker_file" ]] || rm -f "$marker_file"
+  if [[ "$service_stopped" == 1 && "$upgrade_succeeded" == 0 ]]; then
+    printf '升级未完成，正在尝试恢复原后台服务。\n' >&2
+    restore_service
+  fi
+  exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 mkdir -p "$repo_dir/.runtime"
 marker_file="$(mktemp "$repo_dir/.runtime/macos-upgrade-marker.XXXXXX")"
 
@@ -156,8 +168,19 @@ printf 'E2 已通过。现在短暂停止后台服务并提升已验证构建。
 if launchctl print "$service_target" >/dev/null 2>&1; then
   launchctl bootout "$service_target"
 fi
+service_stopped=1
 if ! wait_for_port_release; then
   printf '端口 %s 未释放；未提升构建。\n' "$port" >&2
+  exit 1
+fi
+
+task_backup_result="$runtime_dir/task-data-backup.json"
+if ! node "$repo_dir/scripts/backup-task-data-for-upgrade.mjs" \
+  --confirm-stopped \
+  "$home_dir/.pi-task/pi-task.sqlite" \
+  "$home_dir/.pi-task-backups" \
+  "$task_backup_result"; then
+  printf 'Task 数据备份或副本迁移验证失败；不会提升构建。\n' >&2
   exit 1
 fi
 
@@ -198,6 +221,9 @@ if ! start_background_service || ! wait_for_page '200' 45; then
   exit 1
 fi
 
-trap - EXIT INT TERM
 "$repo_dir/scripts/status-macos-background-service.sh"
-printf 'Pi Task 已升级并恢复为后台服务。此次升级未发送模型提示词；现在可从 Dock 发送一条无敏感内容的测试消息。\n'
+service_stopped=0
+upgrade_succeeded=1
+trap - EXIT INT TERM
+printf 'Pi Task 已升级并恢复为后台服务。Task 数据备份与迁移验证记录：%s\n' "$task_backup_result"
+printf '此次升级未发送模型提示词；现在可从 Dock 发送一条无敏感内容的测试消息。\n'

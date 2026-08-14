@@ -31,7 +31,7 @@ interface ModelOption {
 }
 
 interface Props {
-  onSend: (message: string, images?: AttachedImage[]) => void;
+  onSend: (message: string, images?: AttachedImage[], options?: { programmatic?: boolean }) => void;
   onAbort: () => void;
   onSteer?: (message: string, images?: AttachedImage[]) => void;
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
@@ -75,10 +75,13 @@ interface Props {
   cwd?: string | null;
 }
 
+export type ProgrammaticSendResult = "sent" | "busy" | "draft_present" | "tools_disabled" | "invalid";
+
 export interface ChatInputHandle {
   insertText: (text: string) => void;
   insertIfEmpty: (text: string) => void;
   prependText: (text: string) => void;
+  sendIfEmpty: (text: string) => ProgrammaticSendResult;
   addImages: (files: File[]) => void;
 }
 
@@ -447,6 +450,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         ta.style.height = "auto";
         ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
       });
+    },
+    sendIfEmpty(text: string): ProgrammaticSendResult {
+      const message = text.trim();
+      if (!message) return "invalid";
+      if (isStreaming) return "busy";
+      if (valueRef.current.trim() || attachedImagesRef.current.length > 0) return "draft_present";
+      if (toolPreset === "none") return "tools_disabled";
+      onAudioUnlock?.();
+      onSend(message, undefined, { programmatic: true });
+      if (draftKeyRef.current) clearDraft(draftKeyRef.current);
+      return "sent";
     },
     addImages(files: File[]) {
       processImageFiles(files);

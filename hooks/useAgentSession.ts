@@ -10,7 +10,11 @@ import type {
   SessionTreeNode,
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
-import { sendAgentCommand } from "@/lib/agent-client";
+import {
+  applyAssistantMessageEvent,
+  createAssistantMessageStreamAccumulator,
+} from "@/lib/assistant-message-stream";
+import { AgentCommandRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import type { RunRecord, TaskRecord } from "@/lib/task/types";
@@ -151,8 +155,9 @@ export interface UseAgentSessionOptions {
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
   onSystemPromptChange?: (prompt: string | null) => void;
   onSessionStatsPanelOpen?: () => void;
-  pendingTaskStart?: { taskId: string; version: number } | null;
+  pendingTaskStart?: { taskId: string; version: number; operationId?: string } | null;
   onTaskStarted?: (result: { task: TaskRecord; run: RunRecord }) => void;
+  onTaskStartFailed?: (message: string) => void;
   setToolPreset?: (preset: "none" | "default" | "full") => void;
 }
 
@@ -339,7 +344,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
     session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSessionStatsPanelOpen,
-    pendingTaskStart, onTaskStarted,
+    pendingTaskStart, onTaskStarted, onTaskStartFailed,
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
@@ -355,18 +360,34 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [bashRunning, setBashRunning] = useState(false);
   const [pendingBash, setPendingBash] = useState<{ command: string; excludeFromContext: boolean } | null>(null);
   const activeTaskRunIdRef = useRef<string | null>(null);
+  const activeTaskStartIntentRef = useRef<{ operationId: string; taskId: string; sessionId: string } | null>(null);
   const interruptActiveTaskRun = useCallback(async (reason: string) => {
     const runId = activeTaskRunIdRef.current;
-    if (!runId) return;
+    const startIntent = activeTaskStartIntentRef.current;
+    if (!runId && !startIntent) return;
     activeTaskRunIdRef.current = null;
-    try {
-      await fetch(`/api/task-runs/${encodeURIComponent(runId)}/interrupt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason }),
-      });
-    } catch {
-      // Startup reconciliation is the final fallback for an unreachable server.
+    activeTaskStartIntentRef.current = null;
+    if (runId) {
+      try {
+        await fetch(`/api/task-runs/${encodeURIComponent(runId)}/interrupt`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason }),
+        });
+      } catch {
+        // The start-failed endpoint and restart reconciliation are fallbacks.
+      }
+    }
+    if (startIntent) {
+      try {
+        await fetch("/api/task-framing/start-failed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...startIntent, reason }),
+        });
+      } catch {
+        // Startup reconciliation is the final fallback for an unreachable server.
+      }
     }
   }, []);
   const [modelNames, setModelNames] = useState<Record<string, string>>({});
@@ -431,6 +452,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const thinkingLevelOverrideRef = useRef<Exclude<ThinkingLevelOption, "auto"> | null>(null);
   const promptRunIdRef = useRef(0);
   const optimisticUserMessageKeyRef = useRef<string | null>(null);
+  const assistantMessageStreamRef = useRef(createAssistantMessageStreamAccumulator());
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -930,6 +952,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (sid) await loadSession(sid);
     } finally {
       if (promptRunIdRef.current !== runId) return;
+      if (activeTaskRunIdRef.current || activeTaskStartIntentRef.current) {
+        await interruptActiveTaskRun("Pi became idle before the Task start handoff was confirmed");
+      }
       const promptWasPending = rpcPromptPendingRef.current;
       const agentWasActive = sdkAgentActiveRef.current;
       rpcPromptPendingRef.current = false;
@@ -943,7 +968,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (sid) scheduleEventStreamClose(sid);
     }
-  }, [loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, settleUiStage]);
+  }, [interruptActiveTaskRun, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, settleUiStage]);
 
   const waitForPromptSettlement = useCallback(async (sid: string, runId?: number) => {
     await delay(PROMPT_SETTLE_INITIAL_DELAY_MS);
@@ -1065,6 +1090,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     switch (event.type) {
       case "agent_start":
         cancelEventStreamGrace();
+        assistantMessageStreamRef.current = createAssistantMessageStreamAccumulator();
         sdkAgentActiveRef.current = true;
         agentRunningRef.current = true;
         setAgentRunning(true);
@@ -1108,6 +1134,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           scheduleEventStreamClose(sid);
         }
         activeTaskRunIdRef.current = null;
+        activeTaskStartIntentRef.current = null;
         if (wasRunning) onAgentEnd?.();
         break;
       }
@@ -1143,18 +1170,38 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           message: (event.error as string | undefined) ?? "Extension command failed",
         });
         break;
-      case "message_start":
-      case "message_update": {
+      case "message_start": {
         // Ignore streaming events arriving after this run already finished
         // (e.g. SSE data buffered while the tab was frozen, flushed after
         // reconcile) — they would resurrect a ghost streaming bubble.
         if (!agentRunningRef.current) break;
         const msg = event.message as Partial<AgentMessage> | undefined;
-        if (msg?.role === "user") {
-          break;
+        if (msg?.role === "user") break;
+        assistantMessageStreamRef.current = createAssistantMessageStreamAccumulator(msg);
+        if (assistantMessageStreamRef.current.message) {
+          dispatch({ type: "update", message: assistantMessageStreamRef.current.message });
         }
-        if (msg) {
-          dispatch({ type: "update", message: normalizeToolCalls(msg as AgentMessage) });
+        setAgentPhase(null);
+        break;
+      }
+      case "message_update": {
+        if (!agentRunningRef.current) break;
+
+        // Pi 0.84's JSON/RPC contract is delta-only. The SSE route mirrors it,
+        // so assemble content by contentIndex until message_end supplies the
+        // final authoritative message. Keep a cumulative-message fallback for
+        // an already-open stream during a local hot reload.
+        const cumulative = event.message as Partial<AgentMessage> | undefined;
+        if (cumulative?.role === "assistant") {
+          assistantMessageStreamRef.current = createAssistantMessageStreamAccumulator(cumulative);
+        } else {
+          assistantMessageStreamRef.current = applyAssistantMessageEvent(
+            assistantMessageStreamRef.current,
+            event.assistantMessageEvent,
+          );
+        }
+        if (assistantMessageStreamRef.current.message) {
+          dispatch({ type: "update", message: assistantMessageStreamRef.current.message });
         }
         setAgentPhase(null);
         break;
@@ -1164,6 +1211,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // loadSession already loaded this message from the session file —
         // appending it again would duplicate it.
         if (!agentRunningRef.current) break;
+        assistantMessageStreamRef.current = createAssistantMessageStreamAccumulator();
         const completed = event.message as AgentMessage | undefined;
         if (completed && completed.role === "user") {
           // Delivered steering/follow-up messages surface here as user
@@ -1248,10 +1296,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const startPendingTask = useCallback(async (sessionId: string): Promise<RunRecord | null> => {
     if (!pendingTaskStart) return null;
+    const startIntent = pendingTaskStart.operationId
+      ? { operationId: pendingTaskStart.operationId, taskId: pendingTaskStart.taskId, sessionId }
+      : null;
+    activeTaskStartIntentRef.current = startIntent;
     const response = await fetch(`/api/tasks/${encodeURIComponent(pendingTaskStart.taskId)}/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version: pendingTaskStart.version, sessionId }),
+      body: JSON.stringify({
+        version: pendingTaskStart.version,
+        sessionId,
+        ...(pendingTaskStart.operationId ? { operationId: pendingTaskStart.operationId } : {}),
+      }),
     });
     const body = await response.json().catch(() => ({})) as {
       task?: TaskRecord;
@@ -1262,11 +1318,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       throw new Error(body.error?.message ?? `Unable to start Pi Task (HTTP ${response.status})`);
     }
     activeTaskRunIdRef.current = body.run.id;
+    activeTaskStartIntentRef.current = startIntent;
     onTaskStarted?.({ task: body.task, run: body.run });
     return body.run;
   }, [onTaskStarted, pendingTaskStart]);
 
-  const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleSend = useCallback(async (message: string, images?: AttachedImage[], options?: { programmatic?: boolean }) => {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length) return;
     if (agentRunningRef.current || bashRunningRef.current) return;
@@ -1348,21 +1405,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
     } catch (e) {
       console.error("Failed to send message:", e);
-      if (taskRunStarted && !promptRequestStarted) {
+      const definitelyRejected = e instanceof AgentCommandRejectedError;
+      const taskStartNeedsCompensation = taskRunStarted || Boolean(activeTaskStartIntentRef.current);
+      if (taskStartNeedsCompensation && (!promptRequestStarted || definitelyRejected)) {
         await interruptActiveTaskRun(e instanceof Error ? e.message : String(e));
-        onAgentEnd?.();
+        if (taskRunStarted) onAgentEnd?.();
       }
-      // A failed prompt POST is ambiguous: the server may have accepted it
-      // before the response connection was lost. Keep SSE alive until the
-      // server confirms idle so a real run cannot continue unseen.
-      if (promptRequestStarted && sentSessionId) {
+      // A transport failure after dispatch is ambiguous: the server may have
+      // accepted the prompt before the response connection was lost. Keep SSE
+      // alive until server state is known. An HTTP rejection is definitive and
+      // has already compensated the Task Run above.
+      if (promptRequestStarted && sentSessionId && !definitelyRejected) {
         void waitForPromptSettlement(sentSessionId, promptRunId);
         return;
       }
       rpcPromptPendingRef.current = false;
       agentRunningRef.current = false;
       closeEvents();
-      if (e instanceof EventStreamConnectionError || !promptRequestStarted) {
+      if (e instanceof EventStreamConnectionError || definitelyRejected || !promptRequestStarted) {
         const optimisticKey = optimisticUserMessageKeyRef.current;
         if (optimisticKey) {
           setMessages((prev) => {
@@ -1376,14 +1436,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // The prompt never reached the agent, so restore the user's text into
         // the input instead of losing it. Mirrors the shell-command recovery in
         // executeBash; insertIfEmpty avoids clobbering anything typed since.
-        if (message) opts.chatInputRef?.current?.insertIfEmpty(message);
+        if (message && !options?.programmatic) opts.chatInputRef?.current?.insertIfEmpty(message);
       }
       optimisticUserMessageKeyRef.current = null;
+      if (pendingTaskStart) onTaskStartFailed?.(e instanceof Error ? e.message : String(e));
       setAgentRunning(false);
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, interruptActiveTaskRun, onAgentEnd, opts.chatInputRef, startPendingTask]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, closeEvents, interruptActiveTaskRun, onAgentEnd, onTaskStartFailed, opts.chatInputRef, pendingTaskStart, startPendingTask]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
     if (agentRunningRef.current || bashRunningRef.current) return;

@@ -130,7 +130,12 @@ if (prepared.sessionId !== sessionId || prepared.reused !== true) {
 const tools = (await mutation(`/api/agent/${encodeURIComponent(sessionId)}`, {
   type: "get_tools",
 })).data.map((tool) => tool.name);
-const requiredTools = ["read_task", "request_task_input", "submit_task_review"];
+const requiredTools = [
+  "read_task",
+  ...(process.env.PI_TASK_ENABLE_READONLY_MOA === "1" ? ["delegate_readonly_agents"] : []),
+  "request_task_input",
+  "submit_task_review",
+];
 for (const required of requiredTools) {
   if (!tools.includes(required)) throw new Error(`Prepared Session is missing ${required}`);
 }

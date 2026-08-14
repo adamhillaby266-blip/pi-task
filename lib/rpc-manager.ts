@@ -15,6 +15,7 @@ import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-ty
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS } from "./custom-ui-terminal";
 import { refreshHttpDispatcherForNewPrompt } from "./http-dispatcher";
+import { createTaskFramingExtension } from "./task/framing-extension";
 
 // ============================================================================
 // Types
@@ -95,8 +96,8 @@ const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"
 class PlainTextTheme extends Theme {
   constructor() {
     super(
-      { thinkingXhigh: "" } as ConstructorParameters<typeof Theme>[0],
-      {} as ConstructorParameters<typeof Theme>[1],
+      { thinkingXhigh: "#000000" } as ConstructorParameters<typeof Theme>[0],
+      { selectedBg: "#000000" } as ConstructorParameters<typeof Theme>[1],
       "truecolor",
     );
   }
@@ -174,6 +175,10 @@ export class AgentSessionWrapper {
 
   isRunning(): boolean {
     return this._alive && (this.promptRunning || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+  }
+
+  getStreamingMessageSnapshot(): unknown {
+    return this.inner.agent.state?.streamingMessage;
   }
 
   start(): void {
@@ -1176,6 +1181,7 @@ export async function startRpcSession(
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   const { toolNames, initialModel, thinkingLevel, extensionFactories } = options;
+  const trustedExtensionFactories = [createTaskFramingExtension(), ...(extensionFactories ?? [])];
   const registry = getRegistry();
   const locks = getLocks();
 
@@ -1221,7 +1227,7 @@ export async function startRpcSession(
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
-      ...(extensionFactories?.length ? { resourceLoaderOptions: { extensionFactories } } : {}),
+      resourceLoaderOptions: { extensionFactories: trustedExtensionFactories },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
     const scope = await resolveVisibleModels(

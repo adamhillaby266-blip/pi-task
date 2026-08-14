@@ -20,7 +20,7 @@ Pi Task is for local developer use only.
 - The source launcher accepts only loopback hosts (`127.0.0.1` or `localhost`); documented development and macOS paths use `127.0.0.1:30142`.
 - LAN exposure, reverse proxies, internet hosting, Docker images, npm publication, desktop installers, and GitHub Releases are not supported.
 - Do not run Pi Web and Pi Task against the same active Pi session at the same time.
-- The project may call the model provider configured in your local Pi installation when you send a prompt. Treat prompts, tool results, and selected project files according to that provider's data policy.
+- Pi Task may call the model provider configured in your local Pi installation when you send a prompt. Treat prompts, tool results, and files from the selected working directory according to that provider's data policy.
 
 ## Start from source
 
@@ -43,7 +43,7 @@ For isolated development, validation commands, and the macOS build boundary, rea
 | --- | --- | --- |
 | Pi sessions, model settings, and authentication | `~/.pi/agent` | Pi Task reads local Pi state; session-management and model/auth actions can write local Pi data when you invoke them. |
 | Pi Task data | `~/.pi-task/pi-task.sqlite` | SQLite WAL/SHM sidecars may exist while the app is running. Stop Pi Task before making a manual backup. |
-| Project files | Selected project and session working directories | File access follows the local project/session context. An agent can only be trusted with files you are willing to expose to its configured provider. |
+| Working-directory files | Selected working directory and restored Session directories | File access follows the local directory/Session context. An agent can only be trusted with files you are willing to expose to its configured provider. |
 
 For experiments and tests, set `HOME`, `TMPDIR`, `PI_CODING_AGENT_DIR`, and `PI_TASK_DATA_DIR` to directories under the ignored `.runtime/` directory. Never use real credentials, unpublished material, or company data in fixtures.
 

@@ -30,6 +30,10 @@ if [[ ! -x node_modules/.bin/next ]]; then
   printf '缺少已安装的项目依赖。此 runner 不会执行 npm install 或下载依赖；请停止并确认后再处理。\n' >&2
   exit 1
 fi
+if ! npm ls --depth=0 --silent >/dev/null 2>&1; then
+  printf '已安装依赖与当前 package.json 不一致；不会使用旧依赖构建。请先审查锁文件，再明确执行 npm ci --include=dev --ignore-scripts。\n' >&2
+  exit 1
+fi
 
 # Do not call ensure-platform-native-deps.sh here: it may download packages.
 if ! node -e "require('lightningcss'); require('@tailwindcss/oxide')"; then

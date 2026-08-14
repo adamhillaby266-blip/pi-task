@@ -1,3 +1,5 @@
+import type { TaskContractV1 } from "./contract";
+
 export const TASK_STATUSES = [
   "backlog",
   "ready",
@@ -21,6 +23,19 @@ export const RUN_STATUSES = [
 ] as const;
 
 export type RunStatus = (typeof RUN_STATUSES)[number];
+
+export const DELEGATION_PROFILES = ["scout", "analyst", "critic"] as const;
+export type DelegationProfile = (typeof DELEGATION_PROFILES)[number];
+
+export const DELEGATION_STATUSES = [
+  "running",
+  "succeeded",
+  "failed",
+  "interrupted",
+  "canceled",
+] as const;
+export type DelegationStatus = (typeof DELEGATION_STATUSES)[number];
+
 export type ReviewStatus = "submitted" | "accepted" | "rejected";
 export type EventActor = "user" | "agent" | "system";
 
@@ -45,6 +60,9 @@ export interface TaskRecord {
   primarySessionId: string | null;
   activeRunId: string | null;
   recoveryNote: string | null;
+  contractSchema: number | null;
+  contract: TaskContractV1 | null;
+  contractRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -58,10 +76,67 @@ export interface RunRecord {
   model: string | null;
   error: string | null;
   stopReason: string | null;
+  taskVersionAtStart: number | null;
+  contractRevision: number | null;
+  contractSnapshot: TaskContractV1 | null;
   createdAt: string;
   startedAt: string | null;
   endedAt: string | null;
   updatedAt: string;
+}
+
+export interface DelegationUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost: number;
+}
+
+export interface DelegationRecord {
+  id: string;
+  batchId: string;
+  taskId: string;
+  runId: string;
+  profile: DelegationProfile;
+  prompt: string;
+  status: DelegationStatus;
+  model: string;
+  output: string;
+  error: string | null;
+  usage: DelegationUsage;
+  createdAt: string;
+  startedAt: string;
+  endedAt: string | null;
+  updatedAt: string;
+}
+
+export type TaskFramingCommitAction = "save_draft" | "confirm" | "confirm_and_start";
+export type TaskFramingOperationStatus = "applying" | "saved" | "confirmed" | "awaiting_start" | "started" | "start_failed";
+
+export interface TaskFramingOperationRecord {
+  id: string;
+  sessionId: string;
+  sourceEntryId: string;
+  action: TaskFramingCommitAction;
+  taskId: string | null;
+  runId: string | null;
+  status: TaskFramingOperationStatus;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskFramingCommitInput {
+  operationId: string;
+  sessionId: string;
+  sourceEntryId: string;
+  projectId: string;
+  taskId: string | null;
+  expectedTaskVersion: number | null;
+  action: TaskFramingCommitAction;
+  contract: TaskContractV1;
 }
 
 export interface ArtifactRecord {
@@ -103,6 +178,7 @@ export interface EventRecord {
 export interface TaskDetail extends TaskRecord {
   project: ProjectRecord;
   runs: RunRecord[];
+  delegations: DelegationRecord[];
   artifacts: ArtifactRecord[];
   reviews: ReviewRecord[];
   events: EventRecord[];

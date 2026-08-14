@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -10,6 +11,17 @@ const jiti = createJiti(import.meta.url, {
 });
 const { ChatInput, ModelErrorBanner, ModelLoadIssueBanner, ModelScopeWarningBanner, filterModelOptions } = await jiti.import("./ChatInput.tsx");
 const { I18nProvider } = await jiti.import("../hooks/useI18n.tsx");
+const chatInputSource = await readFile(new URL("./ChatInput.tsx", import.meta.url), "utf8");
+
+
+test("programmatic Task Framing intent preserves busy states, drafts, and disabled tools", () => {
+  assert.match(chatInputSource, /sendIfEmpty: \(text: string\) => ProgrammaticSendResult/);
+  assert.match(chatInputSource, /if \(isStreaming\) return "busy"/);
+  assert.match(chatInputSource, /if \(valueRef\.current\.trim\(\) \|\| attachedImagesRef\.current\.length > 0\) return "draft_present"/);
+  assert.match(chatInputSource, /if \(toolPreset === "none"\) return "tools_disabled"/);
+  assert.match(chatInputSource, /onSend\(message, undefined, \{ programmatic: true \}\)/);
+  assert.match(chatInputSource, /if \(draftKeyRef\.current\) clearDraft\(draftKeyRef\.current\)/);
+});
 
 test("renders the upstream model error", () => {
   const html = renderToStaticMarkup(

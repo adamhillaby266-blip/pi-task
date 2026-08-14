@@ -1,10 +1,10 @@
 # Worktrees in Pi Task
 
-Pi Task can show all Git worktrees for one project in the sidebar. Use this when you want to keep separate checkouts for different branches, while keeping the project's sessions grouped together.
+Pi Task can show all Git worktrees for one repository in the sidebar. Use this when you want separate checkouts for different branches while keeping related sessions easy to find.
 
 ## When the Worktree Control Appears
 
-The worktree switcher appears below the project picker when the selected directory is a Git repository root.
+The worktree switcher appears below the working-directory selector when the selected directory is a Git repository root.
 
 It is hidden when:
 
@@ -12,11 +12,11 @@ It is hidden when:
 - The selected directory is inside a repository, but not the repository root.
 - Git cannot read the repository's worktree list.
 
-If you are inside a repo subdirectory, open the repository root from the project picker to manage worktrees.
+If you are inside a repo subdirectory, use **Open repository root** below the working-directory selector before managing worktrees.
 
 ## Switching Worktrees
 
-Use the worktree switcher to choose which checkout Pi Task should use for new work in that project.
+Use the worktree switcher to choose the working directory Pi Task should use for new work.
 
 Switching worktrees affects:
 
@@ -24,7 +24,7 @@ Switching worktrees affects:
 - The file Explorer.
 - File mentions inserted from the Explorer.
 
-Existing sessions stay grouped under the same project. Opening an existing session moves the effective working directory back to that session's checkout.
+Existing sessions remain grouped internally by repository. Opening one moves the visible working directory back to that session's checkout.
 
 ## Creating a Worktree
 
@@ -64,13 +64,13 @@ If the worktree has uncommitted or untracked files, Git refuses the removal. Pi 
 
 ## Sessions and Worktrees
 
-Pi Task groups sessions by project root, so sessions from the main checkout and linked worktrees appear together.
+Pi Task internally groups sessions by repository root, so sessions from the main checkout and linked worktrees appear together without exposing a separate Project selector.
 
 Each session still remembers the working directory it was created with. That means:
 
 - A session started in a worktree continues to use that worktree path.
 - A session started in the main checkout continues to use the main checkout.
-- If a worktree has been removed, old sessions from it stay visible under the project so you can still find the history.
+- If a worktree has been removed, its old sessions remain visible so you can still find the history.
 
 ## Troubleshooting
 

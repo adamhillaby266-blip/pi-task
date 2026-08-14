@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { ProjectRecord, TaskDetail } from "@/lib/task/types";
+import { workspaceContainsPath } from "@/lib/workspace-path";
 import type { PreparedSession } from "./TaskBoard";
 import styles from "./TaskFromConversationDialog.module.css";
 
@@ -28,12 +29,6 @@ async function readApi<T>(response: Response): Promise<T> {
     throw new Error(message || `HTTP ${response.status}`);
   }
   return body;
-}
-
-function isInsideRoot(cwd: string, root: string): boolean {
-  const normalizedCwd = cwd.replaceAll("\\", "/").replace(/\/$/, "");
-  const normalizedRoot = root.replaceAll("\\", "/").replace(/\/$/, "");
-  return normalizedCwd === normalizedRoot || normalizedCwd.startsWith(`${normalizedRoot}/`);
 }
 
 function defaultTitle(conversation: ConversationSeed): string {
@@ -83,7 +78,7 @@ export function TaskFromConversationDialog({ conversation, onClose, onTaskSaved,
       .then(({ projects: loaded }) => {
         setProjects(loaded);
         const match = loaded
-          .filter((project) => isInsideRoot(conversation.cwd, project.rootPath))
+          .filter((project) => workspaceContainsPath(project.rootPath, conversation.cwd))
           .sort((a, b) => b.rootPath.length - a.rootPath.length)[0];
         if (match) setProjectChoice(match.id);
       })
@@ -97,7 +92,7 @@ export function TaskFromConversationDialog({ conversation, onClose, onTaskSaved,
   }, [conversation.cwd]);
 
   const compatibleProjects = useMemo(
-    () => projects.filter((project) => isInsideRoot(conversation.cwd, project.rootPath)),
+    () => projects.filter((project) => workspaceContainsPath(project.rootPath, conversation.cwd)),
     [conversation.cwd, projects],
   );
   const selectedProject = useMemo(

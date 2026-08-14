@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useState, useCallback, useRef, type CSSProperties, type ReactNode } from "react";
+import type { WorkspaceContextResponse } from "@/lib/api-types";
 import type { SessionInfo } from "@/lib/types";
 import { useI18n } from "@/hooks/useI18n";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -170,6 +171,11 @@ function getRecentProjects(sessions: SessionInfo[]): string[] {
 /** Substitute the home dir prefix with ~ (no path truncation — see PathLabel) */
 function displayCwd(cwd: string, homeDir?: string): string {
   return (homeDir && cwd.startsWith(homeDir)) ? "~" + cwd.slice(homeDir.length) : cwd;
+}
+
+function directoryLabel(cwd: string): string {
+  const normalized = cwd.replaceAll("\\", "/").replace(/\/+$/, "");
+  return normalized.split("/").filter(Boolean).at(-1) || normalized || cwd;
 }
 
 /**
@@ -390,6 +396,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [error, setError] = useState<string | null>(null);
   const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
+  const [workspaceContext, setWorkspaceContext] = useState<WorkspaceContextResponse | null>(null);
+  const [workspaceContextUnavailable, setWorkspaceContextUnavailable] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [projectFilter, setProjectFilter] = useState("");
   const [wtFilter, setWtFilter] = useState("");
@@ -569,6 +577,29 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       if (d.home) setHomeDir(d.home);
     }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    setWorkspaceContext(null);
+    setWorkspaceContextUnavailable(false);
+    if (!selectedCwd) return;
+    const controller = new AbortController();
+    void fetch(`/api/workspace-context?cwd=${encodeURIComponent(selectedCwd)}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json() as Promise<WorkspaceContextResponse>;
+      })
+      .then((context) => {
+        if (!controller.signal.aborted) setWorkspaceContext(context);
+      })
+      .catch((cause: unknown) => {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        setWorkspaceContextUnavailable(true);
+      });
+    return () => controller.abort();
+  }, [selectedCwd, refreshKey]);
 
   const restoredRef = useRef(false);
 
@@ -963,16 +994,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           </div>
         </div>
 
-        {/* CWD picker */}
+        {/* One working-directory context for conversations, files, and Tasks. */}
+        <div style={{ marginBottom: 4, color: "var(--text-dim)", fontSize: 9, fontWeight: 650, letterSpacing: ".04em" }}>
+          {t("sidebar.currentDirectory")}
+        </div>
         <div ref={dropdownRef} style={{ position: "relative" }}>
           <button
             onClick={() => setDropdownOpen((v) => !v)}
-            title={selectedProject ?? selectedCwd ?? ""}
+            title={selectedCwd ?? ""}
             style={{
               width: "100%",
               display: "flex",
               alignItems: "center",
-              padding: "6px 10px",
+              padding: "7px 10px",
               background: selectedCwd ? "var(--bg-hover)" : "rgba(37,99,235,0.06)",
               border: selectedCwd ? "1px solid var(--border)" : "1px solid rgba(37,99,235,0.4)",
               borderRadius: 7,
@@ -984,15 +1018,15 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             }}
           >
             {selectedCwd ? (
-              <PathLabel
-                text={displayCwd(selectedProject ?? selectedCwd, homeDir)}
-                style={{
-                  flex: 1,
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  color: "var(--text)",
-                }}
-              />
+              <span style={{ display: "flex", flex: 1, minWidth: 0, flexDirection: "column", gap: 1 }}>
+                <span style={{ overflow: "hidden", color: "var(--text)", fontSize: 12, fontWeight: 650, textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {directoryLabel(selectedCwd)}
+                </span>
+                <PathLabel
+                  text={displayCwd(selectedCwd, homeDir)}
+                  style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text-dim)" }}
+                />
+              </span>
             ) : (
               <span
                 style={{
@@ -1067,10 +1101,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                     }}
                     style={{
                       display: "flex",
-                      alignItems: "center",
+                      alignItems: "flex-start",
                       gap: 7,
                       width: "100%",
-                      padding: "8px 10px",
+                      padding: "9px 10px",
                       background: "var(--bg)",
                       border: "none",
                       borderBottom: "1px solid var(--border)",
@@ -1079,19 +1113,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                       textAlign: "left",
                       fontSize: 11,
                       fontFamily: "var(--font-mono)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
                     }}
                     title={project}
                   >
                     {project === selectedProject && (
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, marginTop: 3 }}>
                         <polyline points="1.5 5 4 7.5 8.5 2.5" />
                       </svg>
                     )}
                     {project !== selectedProject && <span style={{ width: 10, flexShrink: 0 }} />}
-                    <PathLabel text={displayCwd(project, homeDir)} style={{ flex: 1 }} />
+                    <span style={{ display: "flex", flex: 1, minWidth: 0, flexDirection: "column", gap: 2 }}>
+                      <span style={{ overflow: "hidden", color: project === selectedProject ? "var(--text)" : "var(--text-muted)", fontSize: 11, fontWeight: 650, textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{directoryLabel(project)}</span>
+                      <PathLabel text={displayCwd(project, homeDir)} style={{ color: "var(--text-dim)", fontSize: 9 }} />
+                    </span>
                   </button>
                 ))}
                 {visibleProjects.length === 0 && projectFilter.trim() && (
@@ -1153,6 +1187,32 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
               </button>
           </AnimatedDropdown>
         </div>
+
+        {selectedCwd && (
+          <details style={{ marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 6 }}>
+            <summary style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, color: "var(--text-muted)", cursor: "pointer", fontSize: 9, listStyle: "none" }}>
+              <span>{t("sidebar.workRules")}</span>
+              <span style={{ color: "var(--text-dim)" }}>
+                {workspaceContextUnavailable
+                  ? t("sidebar.workRulesUnavailable")
+                  : workspaceContext
+                    ? t("sidebar.workRulesCount", { count: workspaceContext.ruleSources.length })
+                    : t("common.loading")}
+              </span>
+            </summary>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "7px 0 1px", color: "var(--text-dim)", fontSize: 9, lineHeight: 1.45 }}>
+              <div><strong style={{ color: "var(--text-muted)" }}>{t("sidebar.builtInDiscipline")}</strong><br />{t("sidebar.builtInDisciplineScope")}</div>
+              {workspaceContext?.ruleSources.map((source) => (
+                <div key={source.path} title={source.path}>
+                  <strong style={{ color: "var(--text-muted)" }}>{t(`sidebar.ruleScope.${source.scope}`)}</strong>
+                  <PathLabel text={displayCwd(source.path, homeDir)} style={{ marginTop: 1, fontFamily: "var(--font-mono)" }} />
+                </div>
+              ))}
+              {workspaceContext && workspaceContext.ruleSources.length === 0 && <div>{t("sidebar.noContextRules")}</div>}
+              <div style={{ paddingTop: 5, borderTop: "1px dashed var(--border)" }}>{t("sidebar.rulesNotSandbox")}</div>
+            </div>
+          </details>
+        )}
 
         {/* Worktree switcher — shown only for git projects at a checkout top
             level (repo subdirs keep their own project identity, so switching

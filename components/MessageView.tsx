@@ -2,10 +2,14 @@
 
 import { memo, useState, useRef, useEffect, useMemo } from "react";
 import { MarkdownBody } from "./MarkdownBody";
+import { TaskContractCard } from "./tasks/TaskContractCard";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { getAssistantErrorMessage, isEmptyThinkingBlock } from "@/lib/message-display";
+import { TASK_FRAMING_CUSTOM_TYPE } from "@/lib/task/framing-session";
+import type { TaskDecisionOptionSelection, TaskDecisionOptionSendResult } from "@/lib/task/framing-decision";
+import type { TaskDetail, TaskFramingCommitAction, TaskFramingOperationRecord } from "@/lib/task/types";
 import { parseUnifiedPatch, type SplitDiffCell } from "@/lib/patch";
 import type {
   AgentMessage,
@@ -69,6 +73,10 @@ interface Props {
   showTimestamp?: boolean;
   prevTimestamp?: number;
   sessionId?: string;
+  taskProjectRoot?: string;
+  taskDecisionOptionsDisabled?: boolean;
+  onTaskDecisionOption?: (selection: TaskDecisionOptionSelection) => TaskDecisionOptionSendResult;
+  onTaskFramingCommitted?: (task: TaskDetail, action: TaskFramingCommitAction, operation: TaskFramingOperationRecord) => void | Promise<void>;
 }
 
 function formatTime(ts?: number): string | null {
@@ -98,7 +106,7 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, taskProjectRoot, taskDecisionOptionsDisabled, onTaskDecisionOption, onTaskFramingCommitted }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
   }
@@ -112,6 +120,9 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
   if (message.role === "custom") {
     if ((message as CustomMessage).customType === "compaction") {
       return <CompactionMessageView message={message as CustomMessage} />;
+    }
+    if ((message as CustomMessage).customType === TASK_FRAMING_CUSTOM_TYPE) {
+      return <TaskContractCard message={message as CustomMessage} sessionId={sessionId} projectRoot={taskProjectRoot} decisionOptionsDisabled={taskDecisionOptionsDisabled} onDecisionOption={onTaskDecisionOption} onCommitted={onTaskFramingCommitted} />;
     }
     return <CustomMessageView message={message as CustomMessage} cwd={cwd} onOpenFile={onOpenFile} />;
   }
@@ -134,7 +145,11 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.onEditContent === next.onEditContent
     && prev.showTimestamp === next.showTimestamp
     && prev.prevTimestamp === next.prevTimestamp
-    && prev.sessionId === next.sessionId;
+    && prev.sessionId === next.sessionId
+    && prev.taskProjectRoot === next.taskProjectRoot
+    && prev.taskDecisionOptionsDisabled === next.taskDecisionOptionsDisabled
+    && prev.onTaskDecisionOption === next.onTaskDecisionOption
+    && prev.onTaskFramingCommitted === next.onTaskFramingCommitted;
 });
 
 function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {
@@ -1375,6 +1390,9 @@ function getToolPreview(block: ToolCallContent): string {
   if (keys.length === 0) return "";
 
   // Common tool input patterns
+  if (block.toolName === "delegate_readonly_agents" && Array.isArray(input.tasks)) {
+    return `${input.tasks.length} 个只读子 Agent`;
+  }
   if ("command" in input) return String(input.command).slice(0, 120);
   if ("path" in input) return String(input.path).slice(0, 120);
   if ("file_path" in input) return String(input.file_path).slice(0, 120);
